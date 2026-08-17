@@ -49,17 +49,23 @@ class ReconstructionDataset(Dataset):
         image_pattern = cfg.real_image_pattern if name.startswith("real") else "*.png"
         image_dirs = [root / "images", root / "white_bg", root / "white_bg_images", root]
         self.images_dir = root
-        self.image_paths = sorted(root.glob(image_pattern))
+        self.image_paths = sorted(root.rglob(image_pattern))
         for image_dir in image_dirs:
             if not image_dir.exists():
                 continue
-            paths = sorted(image_dir.glob(image_pattern))
+            paths = sorted(image_dir.rglob(image_pattern))
             if paths:
                 self.images_dir = image_dir
                 self.image_paths = paths
                 break
         mask_dirs = [root / "masks", root / "binary_masks", root / "mask", root]
         self.masks_dir = next((mask_dir for mask_dir in mask_dirs if mask_dir.exists()), root)
+        self.mask_paths_by_name = {
+            path.name: path for path in self.masks_dir.rglob("*.png")
+        }
+        self.mask_paths_by_stem = {
+            path.stem: path for path in self.masks_dir.rglob("*.png")
+        }
         if self.images_dir == self.masks_dir:
             self.image_paths = [p for p in self.image_paths if not p.stem.endswith("_mask")]
         if not self.image_paths:
@@ -110,6 +116,10 @@ class ReconstructionDataset(Dataset):
         for candidate in candidates:
             if candidate.exists():
                 return candidate
+            if candidate.name in self.mask_paths_by_name:
+                return self.mask_paths_by_name[candidate.name]
+            if candidate.stem in self.mask_paths_by_stem:
+                return self.mask_paths_by_stem[candidate.stem]
         return candidates[0]
 
     def __len__(self) -> int:
