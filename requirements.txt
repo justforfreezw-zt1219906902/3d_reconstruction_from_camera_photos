@@ -1,0 +1,9 @@
+torch>=2.2
+torchvision>=0.17
+pytorch3d
+numpy
+pillow
+matplotlib
+tqdm
+python-dotenv
+opencv-python
