@@ -1,30 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import json
 
-from scripts.generate_synthetic_dataset import generate_synthetic_dataset
-from scripts.train_reconstruction import train_dataset
+from src.config import load_config
+from src.pipeline import run_from_config
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PyTorch3D OBJ reconstruction pipeline")
-    parser.add_argument(
-        "--mode",
-        choices=["generate_synthetic", "train", "train_all"],
-        required=True,
-    )
-    parser.add_argument("--dataset", choices=["synthetic", "real1", "real2"])
+    parser = argparse.ArgumentParser(description="OpenScan CAD-guided PyTorch3D reconstruction demo")
+    parser.add_argument("--validate-only", action="store_true", help="Run Gate 1 and stop before PyTorch3D.")
+    parser.add_argument("--camera-fit-only", action="store_true", help="Run camera fitting and Gate 2 only.")
+    parser.add_argument("--skip-camera-fit", action="store_true", help="Skip Stage A and use commanded poses.")
     args = parser.parse_args()
-
-    if args.mode == "generate_synthetic":
-        generate_synthetic_dataset()
-    elif args.mode == "train":
-        if not args.dataset:
-            raise SystemExit("--dataset is required for --mode train")
-        train_dataset(args.dataset)
-    elif args.mode == "train_all":
-        for name in ["synthetic", "real1", "real2"]:
-            train_dataset(name)
+    if args.camera_fit_only and args.skip_camera_fit:
+        parser.error("--camera-fit-only and --skip-camera-fit are mutually exclusive.")
+    result = run_from_config(
+        load_config(),
+        validate_only=args.validate_only,
+        camera_fit_only=args.camera_fit_only,
+        skip_camera_fit=args.skip_camera_fit,
+    )
+    print(json.dumps(result, indent=2, default=str))
 
 
 if __name__ == "__main__":

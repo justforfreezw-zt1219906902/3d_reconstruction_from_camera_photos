@@ -6,13 +6,19 @@ from pytorch3d.loss import mesh_edge_loss, mesh_laplacian_smoothing, mesh_normal
 from pytorch3d.structures import Meshes
 
 
-def silhouette_loss(rendered_mask: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
-    return F.mse_loss(rendered_mask, target_mask)
+def alpha_silhouette_loss(rendered_alpha: torch.Tensor, target_alpha: torch.Tensor) -> torch.Tensor:
+    return F.mse_loss(rendered_alpha, target_alpha)
 
 
-def rgb_loss(rendered_rgb: torch.Tensor, target_rgb: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
-    denom = target_mask.sum().clamp_min(1.0)
-    return (((rendered_rgb - target_rgb) ** 2) * target_mask).sum() / denom
+def soft_iou(rendered_alpha: torch.Tensor, target_alpha: torch.Tensor) -> torch.Tensor:
+    intersection = (rendered_alpha * target_alpha).sum()
+    union = (rendered_alpha + target_alpha - rendered_alpha * target_alpha).sum().clamp_min(1e-6)
+    return intersection / union
+
+
+def masked_rgb_loss(rendered_rgb: torch.Tensor, target_rgb: torch.Tensor, target_alpha: torch.Tensor) -> torch.Tensor:
+    denom = target_alpha.sum().clamp_min(1.0)
+    return (((rendered_rgb - target_rgb) ** 2) * target_alpha).sum() / denom
 
 
 def regularization_losses(mesh: Meshes) -> dict[str, torch.Tensor]:

@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 from pytorch3d.renderer import (
-    AmbientLights,
     BlendParams,
     FoVPerspectiveCameras,
     HardPhongShader,
@@ -18,77 +15,54 @@ from pytorch3d.renderer import (
 from pytorch3d.structures import Meshes
 
 
-@dataclass
-class RenderOutput:
-    rgb: torch.Tensor
-    mask: torch.Tensor
-
-
-def make_blend_params(background_rgb: tuple[float, float, float]) -> BlendParams:
-    return BlendParams(sigma=1e-4, gamma=1e-4, background_color=background_rgb)
+class MPSRendererUnsupported(RuntimeError):
+    pass
 
 
 class ReconstructionRenderer:
-    def __init__(
-        self,
-        image_size: int,
-        device: torch.device,
-        background_rgb: tuple[float, float, float] = (1.0, 1.0, 1.0),
-    ) -> None:
+    def __init__(self, image_size: int, device: torch.device, faces_per_pixel: int = 20) -> None:
         self.image_size = image_size
         self.device = device
-        self.background_rgb = background_rgb
-        self.blend_params = make_blend_params(background_rgb)
-        self.raster_settings_rgb = RasterizationSettings(
-            image_size=image_size,
-            blur_radius=0.0,
-            faces_per_pixel=1,
-        )
-        self.raster_settings_silhouette = RasterizationSettings(
+        self.blend_params = BlendParams(sigma=1e-4, gamma=1e-4, background_color=(1.0, 1.0, 1.0))
+        self.rgb_settings = RasterizationSettings(image_size=image_size, blur_radius=0.0, faces_per_pixel=1)
+        self.silhouette_settings = RasterizationSettings(
             image_size=image_size,
             blur_radius=1e-4,
-            faces_per_pixel=50,
+            faces_per_pixel=faces_per_pixel,
         )
         self.lights = PointLights(device=device, location=[[0.0, 2.0, -3.0]])
-        self.ambient_lights = AmbientLights(device=device)
 
-    def _rgb_renderer(self, cameras: FoVPerspectiveCameras, soft: bool = True) -> MeshRenderer:
-        shader_cls = SoftPhongShader if soft else HardPhongShader
-        return MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.raster_settings_rgb),
-            shader=shader_cls(
+    def _raise_mps(self, exc: Exception) -> None:
+        if self.device.type == "mps":
+            raise MPSRendererUnsupported(
+                "PyTorch3D rasterization is not supported for this MPS operation; restart the full pipeline on CPU."
+            ) from exc
+        raise exc
+
+    def render_mask(self, mesh: Meshes, cameras: FoVPerspectiveCameras) -> torch.Tensor:
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.silhouette_settings),
+            shader=SoftSilhouetteShader(blend_params=self.blend_params),
+        )
+        try:
+            return renderer(mesh)[..., 3:4]
+        except Exception as exc:
+            self._raise_mps(exc)
+            raise
+
+    def render_rgb(self, mesh: Meshes, cameras: FoVPerspectiveCameras, soft: bool = True) -> torch.Tensor:
+        shader = SoftPhongShader if soft else HardPhongShader
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.rgb_settings),
+            shader=shader(
                 device=self.device,
                 cameras=cameras,
                 lights=self.lights,
                 blend_params=self.blend_params,
             ),
         )
-
-    def _mask_renderer(self, cameras: FoVPerspectiveCameras) -> MeshRenderer:
-        return MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.raster_settings_silhouette),
-            shader=SoftSilhouetteShader(blend_params=self.blend_params),
-        )
-
-    def render_rgb(self, mesh: Meshes, cameras: FoVPerspectiveCameras, soft: bool = True) -> torch.Tensor:
-        return self._call_with_mps_fallback(lambda: self._rgb_renderer(cameras, soft=soft)(mesh))[..., :3]
-
-    def render_mask(self, mesh: Meshes, cameras: FoVPerspectiveCameras) -> torch.Tensor:
-        rgba = self._call_with_mps_fallback(lambda: self._mask_renderer(cameras)(mesh))
-        return rgba[..., 3:4]
-
-    def render(self, mesh: Meshes, cameras: FoVPerspectiveCameras) -> RenderOutput:
-        rgb = self.render_rgb(mesh, cameras)
-        mask = self.render_mask(mesh, cameras)
-        return RenderOutput(rgb=rgb, mask=mask)
-
-    def _call_with_mps_fallback(self, fn):
         try:
-            return fn()
+            return renderer(mesh)[..., :3]
         except Exception as exc:
-            if self.device.type != "mps":
-                raise
-            print(f"Warning: PyTorch3D rendering failed on MPS ({exc}). Retrying on CPU.")
-            self.device = torch.device("cpu")
-            self.lights = PointLights(device=self.device, location=[[0.0, 2.0, -3.0]])
-            return fn()
+            self._raise_mps(exc)
+            raise
