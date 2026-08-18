@@ -12,6 +12,37 @@ import torch
 from dotenv import load_dotenv
 
 
+RUNTIME_PROFILES: dict[str, dict[str, int | float | str]] = {
+    "apple_fast": {
+        "device": "cpu", "geometry_max_faces": 5000, "max_image_dimension": 128,
+        "geometry_views_per_epoch": 32, "num_epochs": 20,
+        "silhouette_faces_per_pixel": 5, "geometry_view_batch_size": 1,
+    },
+    "apple_quality": {
+        "device": "cpu", "geometry_max_faces": 10000, "max_image_dimension": 256,
+        "geometry_views_per_epoch": 64, "num_epochs": 30,
+        "silhouette_faces_per_pixel": 10, "geometry_view_batch_size": 1,
+    },
+    "cuda": {
+        "device": "cuda", "geometry_max_faces": 30000, "max_image_dimension": 512,
+        "geometry_views_per_epoch": 0, "num_epochs": 50,
+        "silhouette_faces_per_pixel": 20, "geometry_view_batch_size": 4,
+    },
+    "custom": {},
+}
+
+
+def runtime_profile_defaults(name: str) -> dict:
+    name = (name or "custom").strip().lower()
+    if name not in RUNTIME_PROFILES:
+        raise ValueError(f"Unknown RUNTIME_PROFILE '{name}'. Use apple_fast, apple_quality, cuda, or custom.")
+    return dict(RUNTIME_PROFILES[name])
+
+
+def _profile_value(name: str, defaults: dict, key: str, fallback):
+    return os.getenv(name, str(defaults.get(key, fallback)))
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -38,6 +69,10 @@ class Config:
     positions_csv: Path
     output_dir: Path
     device: str
+    runtime_profile: str
+    geometry_max_faces: int
+    geometry_views_per_epoch: int
+    geometry_view_batch_size: int
     max_image_dimension: int
     camera_distance_initial: float
     camera_fov_initial: float
@@ -81,13 +116,19 @@ class Config:
 
 def load_config(env_file: Optional[str | Path] = None) -> Config:
     load_dotenv(env_file or ".env")
+    runtime_profile = os.getenv("RUNTIME_PROFILE", "custom").strip().lower()
+    profile = runtime_profile_defaults(runtime_profile)
     cfg = Config(
         initial_mesh_path=_path("INITIAL_MESH_PATH", "/absolute/path/to/reference.stl"),
         rgba_dir=_path("RGBA_DIR", "./dataset/rgba"),
         positions_csv=_path("POSITIONS_CSV", "./dataset/positions.csv"),
         output_dir=_path("OUTPUT_DIR", "./outputs/demo"),
-        device=os.getenv("DEVICE", "auto"),
-        max_image_dimension=_int("MAX_IMAGE_DIMENSION", 768),
+        device=_profile_value("DEVICE", profile, "device", "auto"),
+        runtime_profile=runtime_profile,
+        geometry_max_faces=int(_profile_value("GEOMETRY_MAX_FACES", profile, "geometry_max_faces", 10000)),
+        geometry_views_per_epoch=int(_profile_value("GEOMETRY_VIEWS_PER_EPOCH", profile, "geometry_views_per_epoch", 0)),
+        geometry_view_batch_size=int(_profile_value("GEOMETRY_VIEW_BATCH_SIZE", profile, "geometry_view_batch_size", 1)),
+        max_image_dimension=int(_profile_value("MAX_IMAGE_DIMENSION", profile, "max_image_dimension", 768)),
         camera_distance_initial=_float("CAMERA_DISTANCE_INITIAL", 2.7),
         camera_fov_initial=_float("CAMERA_FOV_INITIAL", 60.0),
         camera_fit_enabled=_bool("CAMERA_FIT_ENABLED", True),
@@ -101,8 +142,8 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         pose_refine_epochs=_int("POSE_REFINE_EPOCHS", 3),
         max_theta_delta_deg=_float("MAX_THETA_DELTA_DEG", 2.0),
         max_phi_delta_deg=_float("MAX_PHI_DELTA_DEG", 2.0),
-        num_epochs=_int("NUM_EPOCHS", 50),
-        batch_size=_int("BATCH_SIZE", 1),
+        num_epochs=int(_profile_value("NUM_EPOCHS", profile, "num_epochs", 50)),
+        batch_size=_int("BATCH_SIZE", int(_profile_value("GEOMETRY_VIEW_BATCH_SIZE", profile, "geometry_view_batch_size", 1))),
         opt_lr_verts=_float("OPT_LR_VERTS", 0.0005),
         optimize_texture=_bool("OPTIMIZE_TEXTURE", False),
         loss_silhouette_weight=_float("LOSS_SILHOUETTE_WEIGHT", 1.0),
@@ -119,7 +160,7 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         joint_fine_tune=_bool("JOINT_FINE_TUNE", False),
         center_normalize=_bool("MESH_CENTER_NORMALIZE", True),
         scale_normalize=_bool("MESH_SCALE_NORMALIZE", True),
-        silhouette_faces_per_pixel=_int("SILHOUETTE_FACES_PER_PIXEL", 20),
+        silhouette_faces_per_pixel=int(_profile_value("SILHOUETTE_FACES_PER_PIXEL", profile, "silhouette_faces_per_pixel", 20)),
     )
     if cfg.max_image_dimension <= 0:
         raise ValueError("MAX_IMAGE_DIMENSION must be positive.")
@@ -129,8 +170,10 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         raise ValueError("Camera-fit max faces and max frames must be positive.")
     if cfg.camera_fit_max_evaluations <= 0 or cfg.pose_refine_epochs < 0:
         raise ValueError("Camera-fit evaluation count and pose epochs must be non-negative.")
-    if cfg.batch_size != 1:
-        raise ValueError("The OpenScan demo currently supports BATCH_SIZE=1 only.")
+    if cfg.geometry_max_faces <= 0:
+        raise ValueError("GEOMETRY_MAX_FACES must be positive.")
+    if cfg.geometry_views_per_epoch < 0 or cfg.geometry_view_batch_size <= 0:
+        raise ValueError("GEOMETRY_VIEWS_PER_EPOCH must be non-negative and GEOMETRY_VIEW_BATCH_SIZE positive.")
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     return cfg
 
@@ -149,8 +192,8 @@ def set_seed(seed: int) -> None:
 def select_device(requested: str = "auto") -> torch.device:
     requested = (requested or "auto").lower()
     if requested == "auto":
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
         return torch.device("cpu")
     if requested == "mps":
         if not torch.backends.mps.is_available():
@@ -159,8 +202,7 @@ def select_device(requested: str = "auto") -> torch.device:
         return torch.device("mps")
     if requested == "cuda":
         if not torch.cuda.is_available():
-            print("Warning: DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-            return torch.device("cpu")
+            raise RuntimeError("DEVICE=cuda was explicitly requested, but torch.cuda.is_available() is false.")
         return torch.device("cuda")
     return torch.device("cpu")
 

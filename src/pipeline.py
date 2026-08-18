@@ -55,6 +55,11 @@ def run_demo(
     output_dir.mkdir(parents=True, exist_ok=True)
     save_validation(contract, output_dir / "validation.json")
     save_config_snapshot(cfg, output_dir / "run_config.json")
+    geometry_device = None if camera_fit_only else select_device(cfg.device)
+    if geometry_device is not None:
+        run_config = cfg.as_dict()
+        run_config["actual_device"] = str(geometry_device)
+        (output_dir / "run_config.json").write_text(json.dumps(run_config, indent=2))
 
     camera_result = None if skip_camera_fit else fit_camera(
         cfg.initial_mesh_path,
@@ -72,13 +77,14 @@ def run_demo(
 
     # PyTorch3D is intentionally imported only after the fast CPU Camera Fit Gate.
     from .config import ensure_pytorch3d
-    from .mesh_io import load_initial_mesh, save_transform
+    from .mesh_io import load_initial_mesh, mesh_from_arrays, normalize_vertices, restore_vertices, save_transform
     from .renderer import MPSRendererUnsupported, ReconstructionRenderer
     from .optimizer import train_geometry
     import torch
+    import numpy as np
 
     ensure_pytorch3d()
-    device = select_device(cfg.device)
+    device = geometry_device or select_device(cfg.device)
     from .rgba_dataset import RGBADataset
 
     dataset = RGBADataset(contract, cfg.max_image_dimension)
@@ -88,26 +94,75 @@ def run_demo(
         center_normalize=cfg.center_normalize,
         scale_normalize=cfg.scale_normalize,
     )
-    save_transform(transform, output_dir / "reconstruction" / "mesh_transform.json")
+    reconstruction_dir = output_dir / "reconstruction"
+    reconstruction_dir.mkdir(parents=True, exist_ok=True)
+    save_transform(transform, reconstruction_dir / "mesh_transform.json")
+
+    # Geometry is optimized on a topology-aware proxy; the loaded reference is
+    # retained only as the authoritative source for dimensions and transforms.
+    from .fast_silhouette import FastMesh, create_camera_proxy, save_fast_mesh_stl
+
+    raw_vertices = restore_vertices(base_mesh.verts_packed(), transform).detach().cpu().numpy()
+    raw_faces = base_mesh.faces_packed().detach().cpu().numpy().astype(np.int32)
+    reference_mesh = FastMesh(raw_vertices, raw_faces)
+    geometry_proxy, proxy_method = create_camera_proxy(reference_mesh, cfg.geometry_max_faces)
+    save_fast_mesh_stl(geometry_proxy, reconstruction_dir / "geometry_proxy.stl")
+    proxy_stats = {
+        "original_vertices": int(len(reference_mesh.vertices)),
+        "original_faces": int(len(reference_mesh.faces)),
+        "geometry_vertices": int(len(geometry_proxy.vertices)),
+        "geometry_faces": int(len(geometry_proxy.faces)),
+        "reduction_ratio": float(len(geometry_proxy.faces) / max(len(reference_mesh.faces), 1)),
+        "method": proxy_method,
+        "bbox_min": geometry_proxy.vertices.min(axis=0).tolist(),
+        "bbox_max": geometry_proxy.vertices.max(axis=0).tolist(),
+    }
+    (reconstruction_dir / "geometry_proxy_stats.json").write_text(json.dumps(proxy_stats, indent=2))
+    normalized_proxy_vertices = normalize_vertices(
+        torch.from_numpy(geometry_proxy.vertices.astype(np.float32)), transform
+    )
+    geometry_mesh = mesh_from_arrays(
+        normalized_proxy_vertices,
+        torch.from_numpy(geometry_proxy.faces),
+        device,
+    )
+    del base_mesh
     camera_model = _build_geometry_model(contract, cfg, device, camera_result)
     renderer = ReconstructionRenderer(dataset.canvas_size, device, cfg.silhouette_faces_per_pixel)
     try:
-        renderer.probe(base_mesh, camera_model.cameras([0]))
+        renderer.probe(geometry_mesh, camera_model.cameras([0]))
     except MPSRendererUnsupported:
         if device.type != "mps":
             raise
         print("Warning: PyTorch3D rasterization is unavailable on MPS; using CPU for geometry reconstruction.")
         device = torch.device("cpu")
-        base_mesh, transform = load_initial_mesh(
-            cfg.initial_mesh_path,
-            device,
-            center_normalize=cfg.center_normalize,
-            scale_normalize=cfg.scale_normalize,
-        )
         camera_model = _build_geometry_model(contract, cfg, device, camera_result)
         renderer = ReconstructionRenderer(dataset.canvas_size, device, cfg.silhouette_faces_per_pixel)
+        geometry_mesh = mesh_from_arrays(
+            normalized_proxy_vertices,
+            torch.from_numpy(geometry_proxy.faces),
+            device,
+        )
+    except Exception as exc:
+        if device.type == "cuda" and cfg.device.lower() == "cuda":
+            raise RuntimeError(
+                "CUDA geometry rasterization probe failed after DEVICE=cuda was explicitly requested."
+            ) from exc
+        if device.type == "cuda" and cfg.device.lower() == "auto":
+            print(f"Warning: CUDA geometry probe failed ({exc}); using CPU for geometry reconstruction.")
+            device = torch.device("cpu")
+            geometry_mesh = mesh_from_arrays(
+                normalized_proxy_vertices,
+                torch.from_numpy(geometry_proxy.faces),
+                device,
+            )
+            camera_model = _build_geometry_model(contract, cfg, device, camera_result)
+            renderer = ReconstructionRenderer(dataset.canvas_size, device, cfg.silhouette_faces_per_pixel)
+            renderer.probe(geometry_mesh, camera_model.cameras([0]))
+        else:
+            raise
     geometry_result = train_geometry(
-        base_mesh,
+        geometry_mesh,
         transform,
         dataset,
         camera_model,
@@ -115,6 +170,7 @@ def run_demo(
         cfg,
         device,
         output_dir,
+        mesh_stats=proxy_stats,
     )
     summary = {
         "status": "completed",

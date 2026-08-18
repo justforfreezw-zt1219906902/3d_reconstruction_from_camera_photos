@@ -136,6 +136,28 @@ def restore_vertices(verts: torch.Tensor, transform: MeshTransform) -> torch.Ten
     return result
 
 
+def normalize_vertices(vertices: torch.Tensor, transform: MeshTransform) -> torch.Tensor:
+    """Put raw proxy vertices into the exact frame used by the reference mesh."""
+    result = vertices
+    if transform.center_normalized:
+        result = result - torch.tensor(transform.center, dtype=result.dtype, device=result.device)
+    if transform.scale_normalized:
+        result = result / transform.scale
+    return result
+
+
+def mesh_from_arrays(
+    vertices: torch.Tensor,
+    faces: torch.Tensor,
+    device: torch.device,
+) -> Meshes:
+    verts = vertices.to(device=device, dtype=torch.float32)
+    face_tensor = faces.to(device=device, dtype=torch.int64)
+    mesh = Meshes(verts=[verts], faces=[face_tensor])
+    mesh.textures = TexturesVertex(verts_features=torch.ones_like(mesh.verts_padded()))
+    return mesh
+
+
 def save_transform(transform: MeshTransform, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(asdict(transform), indent=2))

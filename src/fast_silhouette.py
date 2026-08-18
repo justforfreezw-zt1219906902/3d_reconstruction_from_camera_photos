@@ -142,10 +142,23 @@ def create_camera_proxy(mesh: FastMesh, max_faces: int) -> tuple[FastMesh, str]:
             np.asarray(simplified.triangles, dtype=np.int32).copy(),
         )
         if len(proxy.faces) > 0:
-            return proxy, "open3d_quadric_decimation"
+            return _match_proxy_bbox(proxy, mesh), "open3d_quadric_decimation"
     except Exception:
         pass
-    return _fallback_proxy(mesh, max_faces), "deterministic_face_voxel_fallback"
+    return _match_proxy_bbox(_fallback_proxy(mesh, max_faces), mesh), "deterministic_face_voxel_fallback"
+
+
+def _match_proxy_bbox(proxy: FastMesh, reference: FastMesh) -> FastMesh:
+    """Keep decimation from changing the reference physical dimensions/frame."""
+    source_min = proxy.vertices.min(axis=0)
+    source_max = proxy.vertices.max(axis=0)
+    target_min = reference.vertices.min(axis=0)
+    target_max = reference.vertices.max(axis=0)
+    source_extent = source_max - source_min
+    target_extent = target_max - target_min
+    safe_extent = np.where(source_extent > 1e-12, source_extent, 1.0)
+    vertices = (proxy.vertices - source_min) / safe_extent * target_extent + target_min
+    return FastMesh(vertices, proxy.faces.copy())
 
 
 def save_fast_mesh_stl(mesh: FastMesh, path: Path) -> None:

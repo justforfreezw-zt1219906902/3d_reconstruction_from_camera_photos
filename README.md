@@ -51,7 +51,17 @@ For the existing project environment, use its absolute interpreter consistently:
 /Users/zhaowei/PyCharmMiscProject/xolo_3d_reconstrcuction/segmentation_compare/.venv/bin/python main.py
 ```
 
-PyTorch3D rasterization may not support every MPS operation. The pipeline retries the complete run on CPU if an MPS renderer operation fails, so partial MPS tensors are never mixed with CPU tensors.
+PyTorch3D rasterization is kept off MPS by default. Geometry uses CUDA when explicitly configured and available, otherwise CPU. `DEVICE=cuda` fails before reconstruction if CUDA or the PyTorch3D probe is unavailable; `DEVICE=auto` may fall back to CPU.
+
+Runtime profiles provide reproducible geometry defaults:
+
+```env
+RUNTIME_PROFILE=apple_fast    # CPU, 5k faces, 128 px, 32 views/epoch, 20 epochs
+# RUNTIME_PROFILE=apple_quality  # CPU, 10k faces, 256 px, 64 views/epoch, 30 epochs
+# RUNTIME_PROFILE=cuda           # CUDA, 30k faces, 512 px, all views, 50 epochs
+```
+
+Every explicit environment value overrides its profile value. `GEOMETRY_VIEWS_PER_EPOCH=0` means all validated frames. The geometry stage creates `reconstruction/geometry_proxy.stl` for optimization and leaves the original reference STL untouched.
 
 ## Commands
 
@@ -76,7 +86,7 @@ Gate 1 input validation
 → initial pose previews
 → global camera fitting and bounded pose refinement
 → Gate 2 camera fit
-→ shuffled epoch-based geometry reconstruction
+→ stratified view-batch geometry reconstruction
 → deformation and optimization health gates
 → OBJ/STL export
 ```
@@ -121,6 +131,10 @@ outputs/demo/
 │   ├── selected_frames.csv
 │   └── previews/
 ├── reconstruction/
+│   ├── geometry_proxy.stl
+│   ├── geometry_proxy_stats.json
+│   ├── profile.json
+│   ├── view_usage.csv
 │   ├── final.obj
 │   ├── final.stl
 │   ├── mesh_transform.json
@@ -141,4 +155,4 @@ Run tests with the same interpreter used for the project:
 /absolute/path/to/python -m pytest -q
 ```
 
-Tests cover CSV/RGBA validation, soft alpha preservation, aspect-safe padding, OpenScan rotation/inverse consistency, STL loading/restoration, epoch order, and safety gate behavior.
+Tests cover CSV/RGBA validation, soft alpha preservation, aspect-safe padding, OpenScan rotation/inverse consistency, STL loading/restoration, geometry profiles and sampling, proxy limits, output directory creation, and safety gate behavior.
