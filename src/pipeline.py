@@ -56,6 +56,18 @@ def run_demo(
     )
     save_transform(transform, output_dir / "reconstruction" / "mesh_transform.json")
     camera_model = _build_camera_model(contract, cfg, device)
+    camera_renderer = ReconstructionRenderer(
+        cfg.camera_fit_max_dimension,
+        device,
+        cfg.camera_fit_faces_per_pixel,
+    )
+    try:
+        camera_renderer.probe(base_mesh, camera_model.cameras([0]))
+    except MPSRendererUnsupported:
+        if device.type != "mps" or forced_device is not None:
+            raise
+        print("Warning: PyTorch3D camera rasterization is unavailable on MPS; using CPU for this run.")
+        return run_demo(cfg, contract, camera_fit_only, skip_camera_fit, torch.device("cpu"))
     renderer = ReconstructionRenderer(dataset.canvas_size, device, cfg.silhouette_faces_per_pixel)
     if skip_camera_fit:
         camera_model.freeze()
@@ -65,7 +77,7 @@ def run_demo(
             base_mesh,
             dataset,
             camera_model,
-            renderer,
+            camera_renderer,
             cfg,
             device,
             output_dir / "camera_fit",

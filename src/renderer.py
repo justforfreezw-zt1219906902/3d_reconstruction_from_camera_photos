@@ -31,6 +31,28 @@ class ReconstructionRenderer:
             faces_per_pixel=faces_per_pixel,
         )
         self.lights = PointLights(device=device, location=[[0.0, 2.0, -3.0]])
+        self._silhouette_renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(raster_settings=self.silhouette_settings),
+            shader=SoftSilhouetteShader(blend_params=self.blend_params),
+        )
+        self._rgb_renderers = {
+            True: MeshRenderer(
+                rasterizer=MeshRasterizer(raster_settings=self.rgb_settings),
+                shader=SoftPhongShader(
+                    device=device,
+                    lights=self.lights,
+                    blend_params=self.blend_params,
+                ),
+            ),
+            False: MeshRenderer(
+                rasterizer=MeshRasterizer(raster_settings=self.rgb_settings),
+                shader=HardPhongShader(
+                    device=device,
+                    lights=self.lights,
+                    blend_params=self.blend_params,
+                ),
+            ),
+        }
 
     def _raise_mps(self, exc: Exception) -> None:
         if self.device.type == "mps":
@@ -40,29 +62,31 @@ class ReconstructionRenderer:
         raise exc
 
     def render_mask(self, mesh: Meshes, cameras: FoVPerspectiveCameras) -> torch.Tensor:
-        renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.silhouette_settings),
-            shader=SoftSilhouetteShader(blend_params=self.blend_params),
-        )
+        render_mesh = self._mesh_for_cameras(mesh, cameras)
         try:
-            return renderer(mesh)[..., 3:4]
+            return self._silhouette_renderer(render_mesh, cameras=cameras)[..., 3:4]
         except Exception as exc:
             self._raise_mps(exc)
             raise
 
     def render_rgb(self, mesh: Meshes, cameras: FoVPerspectiveCameras, soft: bool = True) -> torch.Tensor:
-        shader = SoftPhongShader if soft else HardPhongShader
-        renderer = MeshRenderer(
-            rasterizer=MeshRasterizer(cameras=cameras, raster_settings=self.rgb_settings),
-            shader=shader(
-                device=self.device,
-                cameras=cameras,
-                lights=self.lights,
-                blend_params=self.blend_params,
-            ),
-        )
+        render_mesh = self._mesh_for_cameras(mesh, cameras)
         try:
-            return renderer(mesh)[..., :3]
+            return self._rgb_renderers[soft](render_mesh, cameras=cameras)[..., :3]
         except Exception as exc:
             self._raise_mps(exc)
             raise
+
+    @staticmethod
+    def _mesh_for_cameras(mesh: Meshes, cameras: FoVPerspectiveCameras) -> Meshes:
+        camera_count = int(cameras.R.shape[0])
+        mesh_count = len(mesh)
+        if mesh_count == camera_count:
+            return mesh
+        if mesh_count == 1:
+            return mesh.extend(camera_count)
+        raise ValueError(f"Mesh batch ({mesh_count}) does not match camera batch ({camera_count}).")
+
+    def probe(self, mesh: Meshes, cameras: FoVPerspectiveCameras) -> None:
+        """Run one rasterization before optimization so unsupported MPS fails early."""
+        self.render_mask(mesh, cameras)

@@ -91,6 +91,8 @@ Gate 1 input validation
 
 The STL is frozen during camera fitting and camera parameters are frozen during the standard geometry baseline. RGB loss and texture optimization are disabled by default.
 
+Camera fitting uses a separate low-resolution alpha cache. Stage A uses up to `CAMERA_FIT_MAX_FRAMES` deterministic representatives, then the Camera Fit Gate evaluates every usable frame. Optional pose refinement runs afterward with bounded corrections and a small number of epochs. The reconstruction resolution in `MAX_IMAGE_DIMENSION` is not used for camera fitting.
+
 ## Aspect ratio and poses
 
 Images are uniformly resized only when `MAX_IMAGE_DIMENSION` requires it, then symmetrically padded to a fixed renderer canvas. They are never stretched to a square. The run records original/processed dimensions, scale, and padding in `validation.json`.
@@ -107,7 +109,9 @@ outputs/demo/
 │   ├── camera_parameters.json
 │   ├── frame_poses.csv
 │   ├── metrics.json
+│   ├── profile.json
 │   ├── pose_convention.json
+│   ├── selected_frames.csv
 │   └── previews/
 ├── reconstruction/
 │   ├── final.obj

@@ -196,6 +196,20 @@ class OpenScanCameraModel(torch.nn.Module):
         for parameter in self.parameters():
             parameter.requires_grad_(False)
 
+    def global_parameters(self) -> list[torch.nn.Parameter]:
+        return [self.raw_distance, self.raw_fov, self.raw_x_offset, self.raw_y_offset]
+
+    def pose_parameters(self) -> list[torch.nn.Parameter]:
+        return [self.raw_theta_delta, self.raw_phi_delta]
+
+    def set_global_trainable(self, enabled: bool) -> None:
+        for parameter in self.global_parameters():
+            parameter.requires_grad_(enabled)
+
+    def set_pose_trainable(self, enabled: bool) -> None:
+        for parameter in self.pose_parameters():
+            parameter.requires_grad_(enabled and self.pose_refine)
+
 
 def save_pose_convention(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)

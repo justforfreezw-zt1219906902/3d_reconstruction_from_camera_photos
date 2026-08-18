@@ -61,6 +61,28 @@ def load_rgba_with_layout(path: Path, layout: ImageLayout) -> tuple[torch.Tensor
     return rgb, alpha
 
 
+def load_alpha_with_layout(path: Path, layout: ImageLayout) -> torch.Tensor:
+    """Load only the soft alpha channel and apply the same aspect-safe layout."""
+    with Image.open(path) as source:
+        alpha = source.convert("RGBA").getchannel("A")
+        resized = alpha.resize((layout.processed_width, layout.processed_height), Image.Resampling.LANCZOS)
+        canvas = Image.new("L", (layout.canvas_size, layout.canvas_size), 0)
+        canvas.paste(resized, (layout.padding_left, layout.padding_top))
+    array = np.asarray(canvas).astype(np.float32) / 255.0
+    return torch.from_numpy(array[..., None].copy())
+
+
+def load_rgb_with_layout(path: Path, layout: ImageLayout) -> torch.Tensor:
+    """Load RGB only for an explicitly requested diagnostic preview."""
+    with Image.open(path) as source:
+        rgb = source.convert("RGB")
+        resized = rgb.resize((layout.processed_width, layout.processed_height), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (layout.canvas_size, layout.canvas_size), (255, 255, 255))
+        canvas.paste(resized, (layout.padding_left, layout.padding_top))
+    array = np.asarray(canvas).astype(np.float32) / 255.0
+    return torch.from_numpy(array[..., :3].copy())
+
+
 @dataclass
 class ReconstructionSample:
     image: torch.Tensor
