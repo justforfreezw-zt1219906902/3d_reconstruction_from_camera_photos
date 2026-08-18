@@ -43,12 +43,10 @@ class Config:
     camera_fov_initial: float
     camera_fit_enabled: bool
     camera_fit_max_dimension: int
-    camera_fit_faces_per_pixel: int
+    camera_fit_max_faces: int
     camera_fit_max_frames: int
-    camera_fit_global_epochs: int
-    camera_fit_early_stop_patience: int
-    camera_fit_min_delta: float
-    camera_fit_batch_size: int
+    camera_fit_max_evaluations: int
+    camera_convention_min_median_iou: float
     camera_gate_min_median_iou: float
     pose_refine: bool
     pose_refine_epochs: int
@@ -93,13 +91,11 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         camera_distance_initial=_float("CAMERA_DISTANCE_INITIAL", 2.7),
         camera_fov_initial=_float("CAMERA_FOV_INITIAL", 60.0),
         camera_fit_enabled=_bool("CAMERA_FIT_ENABLED", True),
-        camera_fit_max_dimension=_int("CAMERA_FIT_MAX_DIMENSION", 192),
-        camera_fit_faces_per_pixel=_int("CAMERA_FIT_FACES_PER_PIXEL", 5),
-        camera_fit_max_frames=_int("CAMERA_FIT_MAX_FRAMES", 32),
-        camera_fit_global_epochs=_int("CAMERA_FIT_GLOBAL_EPOCHS", 15),
-        camera_fit_early_stop_patience=_int("CAMERA_FIT_EARLY_STOP_PATIENCE", 3),
-        camera_fit_min_delta=_float("CAMERA_FIT_MIN_DELTA", 0.001),
-        camera_fit_batch_size=_int("CAMERA_FIT_BATCH_SIZE", 4),
+        camera_fit_max_dimension=_int("CAMERA_FIT_MAX_DIMENSION", 128),
+        camera_fit_max_faces=_int("CAMERA_FIT_MAX_FACES", 3000),
+        camera_fit_max_frames=_int("CAMERA_FIT_MAX_FRAMES", 12),
+        camera_fit_max_evaluations=_int("CAMERA_FIT_MAX_EVALUATIONS", 200),
+        camera_convention_min_median_iou=_float("CAMERA_CONVENTION_MIN_MEDIAN_IOU", 0.20),
         camera_gate_min_median_iou=_float("CAMERA_GATE_MIN_MEDIAN_IOU", 0.50),
         pose_refine=_bool("POSE_REFINE", True),
         pose_refine_epochs=_int("POSE_REFINE_EPOCHS", 3),
@@ -129,12 +125,10 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         raise ValueError("MAX_IMAGE_DIMENSION must be positive.")
     if cfg.camera_fit_max_dimension <= 0:
         raise ValueError("CAMERA_FIT_MAX_DIMENSION must be positive.")
-    if cfg.camera_fit_faces_per_pixel <= 0 or cfg.camera_fit_max_frames <= 0:
-        raise ValueError("Camera-fit faces per pixel and max frames must be positive.")
-    if cfg.camera_fit_global_epochs < 0 or cfg.pose_refine_epochs < 0:
-        raise ValueError("Camera-fit epoch counts cannot be negative.")
-    if cfg.camera_fit_batch_size <= 0:
-        raise ValueError("CAMERA_FIT_BATCH_SIZE must be positive.")
+    if cfg.camera_fit_max_faces <= 0 or cfg.camera_fit_max_frames <= 0:
+        raise ValueError("Camera-fit max faces and max frames must be positive.")
+    if cfg.camera_fit_max_evaluations <= 0 or cfg.pose_refine_epochs < 0:
+        raise ValueError("Camera-fit evaluation count and pose epochs must be non-negative.")
     if cfg.batch_size != 1:
         raise ValueError("The OpenScan demo currently supports BATCH_SIZE=1 only.")
     cfg.output_dir.mkdir(parents=True, exist_ok=True)

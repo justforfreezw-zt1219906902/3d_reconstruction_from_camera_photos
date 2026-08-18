@@ -2,20 +2,29 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-import torch
+from PIL import Image
 from tqdm import tqdm
 
 from .config import Config
-from .losses import soft_iou_per_image
-from .openscan_pose import OpenScanCameraModel, save_pose_convention
-from .rgba_dataset import RGBADataset, ImageLayout, load_alpha_with_layout, load_rgb_with_layout
-from .renderer import ReconstructionRenderer
-from .visualization import save_stage_preview
+from .fast_silhouette import (
+    CameraParameters,
+    FastMesh,
+    FastSilhouetteRenderer,
+    create_camera_proxy,
+    load_fast_mesh,
+    save_fast_mesh_stl,
+    silhouette_iou,
+    silhouette_summary,
+)
+from .pose_conventions import CameraConvention, candidate_conventions
+from .rgba_dataset import build_layouts, load_alpha_with_layout, load_rgb_with_layout
+from .validation import DatasetContract, FrameRecord
 
 
 class CameraFitGateError(RuntimeError):
@@ -23,379 +32,362 @@ class CameraFitGateError(RuntimeError):
 
 
 @dataclass
-class CameraFitResult:
-    model: OpenScanCameraModel
+class FastCameraFitResult:
+    camera: CameraParameters
+    convention: CameraConvention
+    theta_deltas: list[float]
+    phi_deltas: list[float]
     metrics: dict
 
 
 @dataclass
-class CameraFitAlphaCache:
-    """Low-resolution alpha tensors kept alive for the entire camera fit."""
-
-    alphas: torch.Tensor
-    layouts: tuple[ImageLayout, ...]
-    preload_seconds: float
-    batch_size: int = 1
-
-    @property
-    def image_size(self) -> int:
-        return int(self.alphas.shape[1])
-
-    def batch(self, indices: list[int]) -> torch.Tensor:
-        return self.alphas[indices]
+class CameraFitData:
+    frames: tuple[FrameRecord, ...]
+    layouts: tuple
+    alphas: tuple[np.ndarray, ...]
+    image_size: int
 
 
-def preload_camera_fit_alpha(
-    dataset: RGBADataset,
-    max_dimension: int,
-    device: torch.device,
-) -> CameraFitAlphaCache:
+def _load_camera_fit_data(contract: DatasetContract, max_dimension: int) -> tuple[CameraFitData, float]:
     started = time.perf_counter()
-    # Layout creation is shared with reconstruction and never stretches images.
-    from .rgba_dataset import build_layouts
-
-    layouts = build_layouts(dataset.contract, max_dimension)
-    alphas = [
-        load_alpha_with_layout(frame.image_path, layout)
-        for frame, layout in zip(dataset.frames, layouts)
-    ]
-    return CameraFitAlphaCache(
-        alphas=torch.stack(alphas).to(device),
-        layouts=layouts,
-        preload_seconds=time.perf_counter() - started,
-        batch_size=1,
+    layouts = build_layouts(contract, max_dimension)
+    alphas = tuple(
+        load_alpha_with_layout(frame.image_path, layout).numpy()[..., 0]
+        for frame, layout in zip(contract.frames, layouts)
     )
+    return CameraFitData(contract.frames, layouts, alphas, layouts[0].canvas_size), time.perf_counter() - started
 
 
-def _theta_distance(a: float, b: float) -> float:
-    difference = abs((a - b) % 360.0)
-    return min(difference, 360.0 - difference)
-
-
-def select_representative_indices(dataset: RGBADataset, max_frames: int) -> list[int]:
-    """Select deterministic phi-ring and theta-stratified representatives."""
+def select_representative_indices(data: CameraFitData | object, max_frames: int) -> list[int]:
+    frames = data.frames
     groups: dict[float, list[int]] = {}
-    for index, frame in enumerate(dataset.frames):
+    for index, frame in enumerate(frames):
         groups.setdefault(round(frame.phi_deg, 6), []).append(index)
     rings = sorted(groups)
     if not rings:
         return []
-    # Keeping one frame per phi ring is a correctness requirement. A smaller
-    # configured limit therefore expands to the number of rings.
     limit = max(max_frames, len(rings))
     base, remainder = divmod(limit, len(rings))
     selected: set[int] = set()
     for ring_index, phi in enumerate(rings):
-        candidates = sorted(groups[phi], key=lambda i: (dataset.frames[i].theta_deg % 360.0, dataset.frames[i].position_index))
-        slots = base + (1 if ring_index < remainder else 0)
-        slots = max(1, min(slots, len(candidates)))
+        candidates = sorted(groups[phi], key=lambda i: (frames[i].theta_deg % 360.0, frames[i].position_index))
+        slots = max(1, min(len(candidates), base + (ring_index < remainder)))
         for slot in range(slots):
-            target_theta = 360.0 * slot / slots
+            desired = 360.0 * slot / slots
             choice = min(
                 (i for i in candidates if i not in selected),
-                key=lambda i: (_theta_distance(dataset.frames[i].theta_deg, target_theta), dataset.frames[i].position_index),
+                key=lambda i: (min(abs((frames[i].theta_deg - desired) % 360.0), abs((desired - frames[i].theta_deg) % 360.0)), frames[i].position_index),
                 default=None,
             )
             if choice is not None:
                 selected.add(choice)
-    if len(selected) < limit:
-        remaining = [i for i in range(len(dataset)) if i not in selected]
-        remaining.sort(
-            key=lambda i: (
-                -min(_theta_distance(dataset.frames[i].theta_deg, dataset.frames[j].theta_deg) for j in selected),
-                dataset.frames[i].position_index,
-            )
-        )
-        selected.update(remaining[: limit - len(selected)])
-    return sorted(selected, key=lambda i: dataset.frames[i].position_index)
+    return sorted(selected, key=lambda i: frames[i].position_index)
 
 
-def save_selected_frames(dataset: RGBADataset, indices: list[int], path: Path) -> None:
+def _save_selected_frames(data: CameraFitData, indices: list[int], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["index", "image", "position_index", "phi_deg", "theta_deg"])
         writer.writeheader()
         for index in indices:
-            frame = dataset.frames[index]
-            writer.writerow(
-                {
-                    "index": index,
-                    "image": frame.image,
-                    "position_index": frame.position_index,
-                    "phi_deg": frame.phi_deg,
-                    "theta_deg": frame.theta_deg,
-                }
-            )
+            frame = data.frames[index]
+            writer.writerow({"index": index, **{key: getattr(frame, key) for key in ("image", "position_index", "phi_deg", "theta_deg")}})
 
 
-def _preview(
-    dataset: RGBADataset,
-    cache: CameraFitAlphaCache,
-    index: int,
-    rendered_alpha: torch.Tensor,
-    output_dir: Path,
-    stage: str,
-) -> None:
-    # RGB is intentionally opened only for representative visual diagnostics.
-    rgb = load_rgb_with_layout(dataset.frames[index].image_path, cache.layouts[index])
-    save_stage_preview(
-        rgb[None].to(rendered_alpha.device),
-        cache.alphas[index][None],
-        rendered_alpha,
-        output_dir / "previews" / f"{stage}_{index:04d}.png",
-    )
+def _save_preview(data: CameraFitData, index: int, predicted: np.ndarray, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgb = load_rgb_with_layout(data.frames[index].image_path, data.layouts[index]).numpy()
+    target = np.repeat(data.alphas[index][..., None], 3, axis=2)
+    rendered = np.repeat(predicted[..., None], 3, axis=2)
+    overlay = np.zeros_like(target)
+    overlay[..., 0] = data.alphas[index]
+    overlay[..., 1] = predicted
+    image = np.concatenate([rgb, target, rendered, overlay], axis=1)
+    Image.fromarray(np.clip(image * 255.0, 0, 255).astype(np.uint8)).save(path)
 
 
-def _render_metrics(
-    model: OpenScanCameraModel,
-    mesh,
-    dataset: RGBADataset,
-    renderer: ReconstructionRenderer,
-    cache: CameraFitAlphaCache,
-    device: torch.device,
-    output_dir: Path,
-    stage: str,
-    indices: list[int] | None = None,
+def _evaluate(
+    renderer: FastSilhouetteRenderer,
+    mesh: FastMesh,
+    data: CameraFitData,
+    camera: CameraParameters,
+    convention: CameraConvention,
+    theta_deltas: list[float],
+    phi_deltas: list[float],
+    indices: list[int],
+    output_dir: Path | None = None,
     preview_indices: set[int] | None = None,
+    stage: str = "camera_fit",
 ) -> dict:
-    indices = list(range(len(dataset))) if indices is None else indices
-    preview_indices = set() if preview_indices is None else preview_indices
-    batch_size = max(1, getattr(cache, "batch_size", 1))
     ious: list[float] = []
-    with torch.no_grad():
-        for start in tqdm(range(0, len(indices), batch_size), desc=f"{stage} camera metrics"):
-            batch_indices = indices[start : start + batch_size]
-            rendered_alpha = renderer.render_mask(mesh, model.cameras(batch_indices))
-            target_alpha = cache.batch(batch_indices)
-            batch_ious = soft_iou_per_image(rendered_alpha, target_alpha)
-            ious.extend(float(value.detach().cpu()) for value in batch_ious)
-            for offset, index in enumerate(batch_indices):
-                if index in preview_indices:
-                    _preview(dataset, cache, index, rendered_alpha[offset : offset + 1], output_dir, stage)
+    preview_indices = preview_indices or set()
+    for index in indices:
+        frame = data.frames[index]
+        predicted = renderer.render(
+            mesh,
+            camera,
+            frame.theta_deg + theta_deltas[index],
+            frame.phi_deg + phi_deltas[index],
+            convention,
+        )
+        ious.append(silhouette_iou(predicted, data.alphas[index]))
+        if output_dir is not None and index in preview_indices:
+            _save_preview(data, index, predicted, output_dir / "previews" / f"{stage}_{index:04d}.png")
     return {
         "iou_per_frame": ious,
-        "mean_iou": float(np.mean(ious)),
-        "median_iou": float(np.median(ious)),
-        "worst_frame_iou": float(np.min(ious)),
+        "mean_iou": float(np.mean(ious)) if ious else 0.0,
+        "median_iou": float(np.median(ious)) if ious else 0.0,
+        "worst_frame_iou": float(np.min(ious)) if ious else 0.0,
         "evaluated_frames": len(indices),
     }
 
 
-def _write_camera_outputs(model: OpenScanCameraModel, output_dir: Path, metrics: dict) -> None:
-    (output_dir / "camera_parameters.json").write_text(json.dumps(model.parameters_snapshot(), indent=2))
-    records = model.pose_records()
-    with (output_dir / "frame_poses.csv").open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
-        writer.writeheader()
-        writer.writerows(records)
-    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+def _candidate_camera_fit(
+    renderer: FastSilhouetteRenderer,
+    mesh: FastMesh,
+    data: CameraFitData,
+    indices: list[int],
+    convention: CameraConvention,
+    initial: CameraParameters,
+) -> CameraParameters:
+    camera = CameraParameters(initial.distance, initial.fov_deg, initial.x_offset, initial.y_offset)
+    predicted_summaries = []
+    target_summaries = []
+    for index in indices:
+        frame = data.frames[index]
+        predicted = renderer.render(mesh, camera, frame.theta_deg, frame.phi_deg, convention)
+        predicted_summaries.append(silhouette_summary(predicted))
+        target_summaries.append(silhouette_summary(data.alphas[index]))
+    ratios = [
+        target["width"] / max(predicted["width"], 1.0)
+        for predicted, target in zip(predicted_summaries, target_summaries)
+        if predicted["width"] > 0 and target["width"] > 0
+    ]
+    if ratios:
+        effective_focal_ratio = float(np.median(ratios))
+        camera.fov_deg = float(np.clip(2.0 * np.rad2deg(np.arctan(np.tan(np.deg2rad(camera.fov_deg) / 2.0) / effective_focal_ratio)), 15.0, 120.0))
+    dx = [target["centroid_x"] - predicted["centroid_x"] for target, predicted in zip(target_summaries, predicted_summaries)]
+    dy = [target["centroid_y"] - predicted["centroid_y"] for target, predicted in zip(target_summaries, predicted_summaries)]
+    if dx:
+        camera.x_offset = float(np.clip(camera.x_offset + 2.0 * np.median(dx) / data.image_size, -1.0, 1.0))
+        camera.y_offset = float(np.clip(camera.y_offset - 2.0 * np.median(dy) / data.image_size, -1.0, 1.0))
+    return camera
 
 
-def _check_finite(loss: torch.Tensor, model: OpenScanCameraModel) -> None:
-    if not torch.isfinite(loss):
-        raise RuntimeError("GATE 5 — OPTIMIZATION HEALTH FAILED: camera fit loss is NaN/Inf.")
-    for parameter in model.parameters():
-        if parameter.grad is not None and not torch.isfinite(parameter.grad).all():
-            raise RuntimeError("GATE 5 — OPTIMIZATION HEALTH FAILED: camera fit gradient is NaN/Inf.")
+def _global_fit(
+    renderer: FastSilhouetteRenderer,
+    mesh: FastMesh,
+    data: CameraFitData,
+    indices: list[int],
+    convention: CameraConvention,
+    initial: CameraParameters,
+    max_evaluations: int,
+) -> tuple[CameraParameters, int]:
+    try:
+        from scipy.optimize import minimize
+    except ImportError as exc:
+        raise RuntimeError("scipy is required for the lightweight numerical camera fit.") from exc
+
+    camera = _candidate_camera_fit(renderer, mesh, data, indices, convention, initial)
+    evaluations = 0
+
+    def bbox_loss(values: np.ndarray) -> float:
+        nonlocal evaluations
+        evaluations += 1
+        candidate = CameraParameters(*[float(value) for value in values])
+        losses = []
+        for index in indices:
+            frame = data.frames[index]
+            predicted = silhouette_summary(renderer.render(mesh, candidate, frame.theta_deg, frame.phi_deg, convention))
+            target = silhouette_summary(data.alphas[index])
+            losses.extend(
+                [
+                    abs(predicted["centroid_x"] - target["centroid_x"]) / data.image_size,
+                    abs(predicted["centroid_y"] - target["centroid_y"]) / data.image_size,
+                    abs(predicted["width"] - target["width"]) / data.image_size,
+                    abs(predicted["height"] - target["height"]) / data.image_size,
+                ]
+            )
+        return float(np.mean(losses))
+
+    def iou_loss(values: np.ndarray) -> float:
+        nonlocal evaluations
+        evaluations += 1
+        candidate = CameraParameters(*[float(value) for value in values])
+        return 1.0 - float(np.mean([
+            silhouette_iou(
+                renderer.render(mesh, candidate, data.frames[index].theta_deg, data.frames[index].phi_deg, convention),
+                data.alphas[index],
+            )
+            for index in indices
+        ]))
+
+    x0 = np.asarray([camera.distance, camera.fov_deg, camera.x_offset, camera.y_offset], dtype=np.float64)
+    bounds = [(0.5, 10.0), (15.0, 120.0), (-1.0, 1.0), (-1.0, 1.0)]
+    first_budget = max(10, max_evaluations // 2)
+    result = minimize(bbox_loss, x0, method="Powell", bounds=bounds, options={"maxfev": first_budget, "xtol": 1e-3, "ftol": 1e-3})
+    result2 = minimize(iou_loss, result.x, method="Powell", bounds=bounds, options={"maxfev": max(10, max_evaluations - evaluations), "xtol": 1e-3, "ftol": 1e-3})
+    return CameraParameters(*[float(value) for value in result2.x]), evaluations
 
 
-def _batched_indices(indices: list[int], batch_size: int):
-    for start in range(0, len(indices), max(1, batch_size)):
-        yield indices[start : start + max(1, batch_size)]
-
-
-def fit_camera(
-    mesh,
-    dataset: RGBADataset,
-    model: OpenScanCameraModel,
-    renderer: ReconstructionRenderer,
-    cfg: Config,
-    device: torch.device,
+def _convention_search(
+    renderer: FastSilhouetteRenderer,
+    proxy: FastMesh,
+    data: CameraFitData,
+    indices: list[int],
+    initial_camera: CameraParameters,
     output_dir: Path,
-) -> CameraFitResult:
+) -> tuple[CameraConvention, list[dict]]:
+    rows: list[dict] = []
+    for convention in tqdm(candidate_conventions(), desc="camera convention search"):
+        camera = _candidate_camera_fit(renderer, proxy, data, indices, convention, initial_camera)
+        theta = [0.0] * len(data.frames)
+        phi = [0.0] * len(data.frames)
+        metrics = _evaluate(renderer, proxy, data, camera, convention, theta, phi, indices)
+        rows.append({**convention.as_dict(), "mean_iou": metrics["mean_iou"], "median_iou": metrics["median_iou"]})
+    rows.sort(key=lambda row: (row["median_iou"], row["mean_iou"]), reverse=True)
+    with (output_dir / "convention_search.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    best = CameraConvention(**{key: rows[0][key] for key in ("theta_axis", "phi_axis", "theta_sign", "phi_sign", "rotation_order")})
+    (output_dir / "selected_convention.json").write_text(json.dumps(best.as_dict(), indent=2))
+    for rank, row in enumerate(rows[:3], start=1):
+        candidate = CameraConvention(**{key: row[key] for key in ("theta_axis", "phi_axis", "theta_sign", "phi_sign", "rotation_order")})
+        candidate_camera = _candidate_camera_fit(renderer, proxy, data, indices, candidate, initial_camera)
+        index = indices[0]
+        frame = data.frames[index]
+        predicted = renderer.render(proxy, candidate_camera, frame.theta_deg, frame.phi_deg, candidate)
+        _save_preview(data, index, predicted, output_dir / "previews" / f"convention_rank_{rank}_{index:04d}.png")
+    return best, rows
+
+
+def _pose_refine(
+    renderer: FastSilhouetteRenderer,
+    proxy: FastMesh,
+    data: CameraFitData,
+    camera: CameraParameters,
+    convention: CameraConvention,
+    cfg: Config,
+    output_dir: Path,
+) -> tuple[list[float], list[float]]:
+    theta_deltas = [0.0] * len(data.frames)
+    phi_deltas = [0.0] * len(data.frames)
+    for epoch in tqdm(range(max(0, cfg.pose_refine_epochs)), desc="fast pose refine"):
+        radius = max(cfg.max_theta_delta_deg, cfg.max_phi_delta_deg) / (2.0 ** epoch)
+        for index, frame in enumerate(data.frames):
+            candidates = []
+            for theta_offset in np.linspace(-min(cfg.max_theta_delta_deg, radius), min(cfg.max_theta_delta_deg, radius), 3):
+                for phi_offset in np.linspace(-min(cfg.max_phi_delta_deg, radius), min(cfg.max_phi_delta_deg, radius), 3):
+                    theta = float(np.clip(theta_deltas[index] + theta_offset, -cfg.max_theta_delta_deg, cfg.max_theta_delta_deg))
+                    phi = float(np.clip(phi_deltas[index] + phi_offset, -cfg.max_phi_delta_deg, cfg.max_phi_delta_deg))
+                    predicted = renderer.render(mesh=proxy, camera=camera, theta_deg=frame.theta_deg + theta, phi_deg=frame.phi_deg + phi, convention=convention)
+                    candidates.append((silhouette_iou(predicted, data.alphas[index]), theta, phi))
+            _, theta_deltas[index], phi_deltas[index] = max(candidates, key=lambda value: value[0])
+    return theta_deltas, phi_deltas
+
+
+def _write_frame_poses(data: CameraFitData, theta_deltas: list[float], phi_deltas: list[float], path: Path) -> None:
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["index", "image", "position_index", "commanded_theta_deg", "commanded_phi_deg", "optimized_theta_delta_deg", "optimized_phi_delta_deg", "final_theta_deg", "final_phi_deg"])
+        writer.writeheader()
+        for index, frame in enumerate(data.frames):
+            writer.writerow({
+                "index": index,
+                "image": frame.image,
+                "position_index": frame.position_index,
+                "commanded_theta_deg": frame.theta_deg,
+                "commanded_phi_deg": frame.phi_deg,
+                "optimized_theta_delta_deg": theta_deltas[index],
+                "optimized_phi_delta_deg": phi_deltas[index],
+                "final_theta_deg": frame.theta_deg + theta_deltas[index],
+                "final_phi_deg": frame.phi_deg + phi_deltas[index],
+            })
+
+
+def fit_camera(mesh_path: Path, contract: DatasetContract, cfg: Config, output_dir: Path) -> FastCameraFitResult:
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
-    save_pose_convention(output_dir / "pose_convention.json")
-    cache = preload_camera_fit_alpha(dataset, cfg.camera_fit_max_dimension, device)
-    cache.batch_size = cfg.camera_fit_batch_size
-    selected = select_representative_indices(dataset, cfg.camera_fit_max_frames)
-    save_selected_frames(dataset, selected, output_dir / "selected_frames.csv")
-    representative_set = set(selected)
-    preview_set = set(dataset.representative_indices()) & representative_set
-
-    initial_started = time.perf_counter()
-    initial_metrics = _render_metrics(
-        model,
-        mesh,
-        dataset,
-        renderer,
-        cache,
-        device,
-        output_dir,
-        "initial",
-        indices=selected,
-        preview_indices=preview_set,
-    )
-    full_gate_seconds = time.perf_counter() - initial_started
-    if not cfg.camera_fit_enabled:
-        model.freeze()
-        metrics = {"enabled": False, "initial": initial_metrics, "final": initial_metrics}
-        _write_camera_outputs(model, output_dir, metrics)
-        _write_profile(
-            output_dir,
-            cfg,
-            len(dataset),
-            len(selected),
-            cache.preload_seconds,
-            0.0,
-            full_gate_seconds,
-            0.0,
-            time.perf_counter() - started,
-            0,
-            0,
-        )
-        return CameraFitResult(model=model, metrics=metrics)
-
-    model.set_global_trainable(True)
-    model.set_pose_trainable(False)
-    global_optimizer = torch.optim.Adam(model.global_parameters(), lr=0.01)
-    best_score = -float("inf")
-    stale_epochs = 0
-    global_history: list[dict] = []
-    global_started = time.perf_counter()
-    global_epochs_executed = 0
-    for epoch in tqdm(range(1, cfg.camera_fit_global_epochs + 1), desc="camera fit global"):
-        order = sorted(selected, key=lambda i: dataset.frames[i].position_index)
-        generator = torch.Generator().manual_seed(cfg.seed + epoch)
-        order = [order[i] for i in torch.randperm(len(order), generator=generator).tolist()]
-        epoch_ious: list[float] = []
-        for batch_indices in _batched_indices(order, cfg.camera_fit_batch_size):
-            rendered_alpha = renderer.render_mask(mesh, model.cameras(batch_indices))
-            batch_iou = soft_iou_per_image(rendered_alpha, cache.batch(batch_indices))
-            loss = 1.0 - batch_iou.mean()
-            global_optimizer.zero_grad()
-            loss.backward()
-            _check_finite(loss, model)
-            global_optimizer.step()
-            epoch_ious.extend(float(value.detach().cpu()) for value in batch_iou)
-        global_epochs_executed = epoch
-        epoch_metrics = {
-            "epoch": epoch,
-            "mean_iou": float(np.mean(epoch_ious)),
-            "median_iou": float(np.median(epoch_ious)),
-        }
-        global_history.append(epoch_metrics)
-        score = max(epoch_metrics["mean_iou"], epoch_metrics["median_iou"])
-        if score > best_score + cfg.camera_fit_min_delta:
-            best_score = score
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-        if cfg.camera_fit_early_stop_patience > 0 and stale_epochs >= cfg.camera_fit_early_stop_patience:
-            break
-    global_seconds = time.perf_counter() - global_started
-
-    # Gate evaluation is always full resolution for camera fitting and always
-    # uses every validated frame, even when Stage A used representatives.
-    model.set_global_trainable(False)
-    model.set_pose_trainable(False)
-    gate_started = time.perf_counter()
-    pre_pose_metrics = _render_metrics(
-        model, mesh, dataset, renderer, cache, device, output_dir, "global_fitted", preview_indices=preview_set
-    )
-    full_gate_seconds += time.perf_counter() - gate_started
-
-    pose_seconds = 0.0
-    pose_epochs_executed = 0
-    if cfg.pose_refine and cfg.pose_refine_epochs > 0:
-        model.set_pose_trainable(True)
-        pose_optimizer = torch.optim.Adam(model.pose_parameters(), lr=0.005)
-        pose_started = time.perf_counter()
-        for epoch in tqdm(range(1, cfg.pose_refine_epochs + 1), desc="camera pose refine"):
-            order = sorted(range(len(dataset)), key=lambda i: dataset.frames[i].position_index)
-            generator = torch.Generator().manual_seed(cfg.seed + 10000 + epoch)
-            order = [order[i] for i in torch.randperm(len(order), generator=generator).tolist()]
-            for batch_indices in _batched_indices(order, cfg.camera_fit_batch_size):
-                rendered_alpha = renderer.render_mask(mesh, model.cameras(batch_indices))
-                batch_iou = soft_iou_per_image(rendered_alpha, cache.batch(batch_indices))
-                loss = 1.0 - batch_iou.mean()
-                pose_optimizer.zero_grad()
-                loss.backward()
-                _check_finite(loss, model)
-                pose_optimizer.step()
-            pose_epochs_executed = epoch
-        pose_seconds = time.perf_counter() - pose_started
-        model.set_pose_trainable(False)
-
-    final_started = time.perf_counter()
-    final_metrics = _render_metrics(
-        model, mesh, dataset, renderer, cache, device, output_dir, "camera_fitted", preview_indices=preview_set
-    )
-    full_gate_seconds += time.perf_counter() - final_started
-    metrics = {
-        "enabled": True,
-        "initial": initial_metrics,
-        "global_history": global_history,
-        "global_fitted": pre_pose_metrics,
-        "final": final_metrics,
-        "camera_gate_uses_all_frames": True,
+    data, preload_seconds = _load_camera_fit_data(contract, cfg.camera_fit_max_dimension)
+    selected = select_representative_indices(data, cfg.camera_fit_max_frames)
+    _save_selected_frames(data, selected, output_dir / "selected_frames.csv")
+    original_mesh, _ = load_fast_mesh(mesh_path, cfg.center_normalize, cfg.scale_normalize)
+    proxy_started = time.perf_counter()
+    proxy, proxy_method = create_camera_proxy(original_mesh, cfg.camera_fit_max_faces)
+    proxy_seconds = time.perf_counter() - proxy_started
+    save_fast_mesh_stl(proxy, output_dir / "proxy_mesh.stl")
+    proxy_stats = {
+        "original_vertex_count": int(len(original_mesh.vertices)),
+        "original_face_count": int(len(original_mesh.faces)),
+        "proxy_vertex_count": int(len(proxy.vertices)),
+        "proxy_face_count": int(len(proxy.faces)),
+        "max_faces": cfg.camera_fit_max_faces,
+        "method": proxy_method,
     }
-    _write_camera_outputs(model, output_dir, metrics)
-    _write_profile(
-        output_dir,
-        cfg,
-        len(dataset),
-        len(selected),
-        cache.preload_seconds,
-        global_seconds,
-        full_gate_seconds,
-        pose_seconds,
-        time.perf_counter() - started,
-        global_epochs_executed,
-        pose_epochs_executed,
-    )
-    if final_metrics["median_iou"] < cfg.camera_gate_min_median_iou:
+    (output_dir / "proxy_mesh_stats.json").write_text(json.dumps(proxy_stats, indent=2))
+    renderer = FastSilhouetteRenderer(data.image_size)
+    initial_camera = CameraParameters(cfg.camera_distance_initial, cfg.camera_fov_initial, 0.0, 0.0)
+    convention_started = time.perf_counter()
+    convention, convention_rows = _convention_search(renderer, proxy, data, selected, initial_camera, output_dir)
+    convention_seconds = time.perf_counter() - convention_started
+    if convention_rows[0]["median_iou"] < cfg.camera_convention_min_median_iou:
         raise CameraFitGateError(
-            "Camera fit gate failed. Do not deform the STL because camera alignment is insufficient. "
-            f"Median IoU={final_metrics['median_iou']:.4f}, "
-            f"required={cfg.camera_gate_min_median_iou:.4f}."
+            "Camera convention sanity gate failed. The OpenScan pose convention, STL orientation, "
+            f"or projection model is inconsistent with observations; best median IoU={convention_rows[0]['median_iou']:.4f}."
         )
-    model.freeze()
-    return CameraFitResult(model=model, metrics=metrics)
-
-
-def _write_profile(
-    output_dir: Path,
-    cfg: Config,
-    total_frames: int,
-    selected_frames: int,
-    preload_seconds: float,
-    global_seconds: float,
-    full_gate_seconds: float,
-    pose_seconds: float,
-    total_seconds: float,
-    global_epochs_executed: int,
-    pose_epochs_executed: int,
-) -> None:
-    batch_size = max(1, cfg.camera_fit_batch_size)
+    initial_metrics = _evaluate(
+        renderer,
+        proxy,
+        data,
+        initial_camera,
+        convention,
+        [0.0] * len(data.frames),
+        [0.0] * len(data.frames),
+        selected,
+        output_dir,
+        set(selected),
+        "initial",
+    )
+    global_started = time.perf_counter()
+    camera, global_evaluations = _global_fit(renderer, proxy, data, selected, convention, initial_camera, cfg.camera_fit_max_evaluations)
+    global_seconds = time.perf_counter() - global_started
+    (output_dir / "global_camera_parameters.json").write_text(json.dumps(camera.as_dict(), indent=2))
+    pose_started = time.perf_counter()
+    theta_deltas, phi_deltas = _pose_refine(renderer, proxy, data, camera, convention, cfg, output_dir) if cfg.pose_refine else ([0.0] * len(data.frames), [0.0] * len(data.frames))
+    pose_seconds = time.perf_counter() - pose_started
+    _write_frame_poses(data, theta_deltas, phi_deltas, output_dir / "frame_poses.csv")
+    preview_indices = set(selected[: min(8, len(selected))])
+    gate_started = time.perf_counter()
+    metrics = _evaluate(renderer, proxy, data, camera, convention, theta_deltas, phi_deltas, list(range(len(data.frames))), output_dir, preview_indices, "camera_fitted")
+    gate_seconds = time.perf_counter() - gate_started
+    metrics.update({
+        "initial": initial_metrics,
+        "camera_gate_uses_all_frames": True,
+        "selected_convention": convention.as_dict(),
+        "proxy_mesh_stats": proxy_stats,
+    })
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
     profile = {
-        "total_frames": total_frames,
-        "selected_coarse_frames": selected_frames,
+        "total_frames": len(data.frames),
+        "selected_coarse_frames": len(selected),
         "camera_fit_resolution": cfg.camera_fit_max_dimension,
-        "faces_per_pixel": cfg.camera_fit_faces_per_pixel,
-        "camera_fit_batch_size": batch_size,
-        "global_fit_epochs_executed": global_epochs_executed,
-        "pose_refinement_epochs": pose_epochs_executed,
-        "alpha_preload_seconds": preload_seconds,
-        "global_fitting_seconds": global_seconds,
-        "full_gate_evaluation_seconds": full_gate_seconds,
+        "proxy_creation_seconds": proxy_seconds,
+        "convention_search_seconds": convention_seconds,
+        "global_fit_seconds": global_seconds,
         "pose_refinement_seconds": pose_seconds,
-        "total_camera_fit_seconds": total_seconds,
-        "old_theoretical_render_count": total_frames * (getattr(cfg, "camera_fit_epochs", 100) + 2),
-        "new_theoretical_render_count": (
-            selected_frames + total_frames * 2
-            + int(np.ceil(selected_frames / batch_size)) * global_epochs_executed
-            + int(np.ceil(total_frames / batch_size)) * pose_epochs_executed
-        ),
+        "full_gate_evaluation_seconds": gate_seconds,
+        "alpha_preload_seconds": preload_seconds,
+        "total_camera_fit_seconds": time.perf_counter() - started,
+        "silhouette_render_count": renderer.render_count,
+        "average_silhouette_render_ms": 1000.0 * renderer.total_render_seconds / max(renderer.render_count, 1),
+        "global_fit_evaluations": global_evaluations,
+        "original_face_count": len(original_mesh.faces),
+        "proxy_face_count": len(proxy.faces),
     }
     (output_dir / "profile.json").write_text(json.dumps(profile, indent=2))
+    if metrics["median_iou"] < cfg.camera_gate_min_median_iou:
+        raise CameraFitGateError(
+            "Camera fit gate failed. Do not deform the STL because camera alignment is insufficient. "
+            f"Median IoU={metrics['median_iou']:.4f}, required={cfg.camera_gate_min_median_iou:.4f}."
+        )
+    return FastCameraFitResult(camera, convention, theta_deltas, phi_deltas, metrics)

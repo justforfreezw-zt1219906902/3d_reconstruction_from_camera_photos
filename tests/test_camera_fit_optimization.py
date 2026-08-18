@@ -3,13 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import torch
+import numpy as np
 from PIL import Image
 
-from src.camera_fitting import preload_camera_fit_alpha, select_representative_indices
-from src.openscan_pose import OpenScanCameraModel
-from src.rgba_dataset import RGBADataset
-from src.renderer import ReconstructionRenderer
+from src.camera_fitting import _load_camera_fit_data, select_representative_indices
+from src.fast_silhouette import CameraParameters, FastMesh, FastSilhouetteRenderer, silhouette_iou
+from src.pose_conventions import CameraConvention, candidate_conventions
 from src.validation import validate_inputs
 
 
@@ -50,7 +49,6 @@ def test_alpha_preload_opens_each_frame_once(tmp_path: Path, monkeypatch) -> Non
     stl_path.write_text("solid empty\nendsolid empty\n")
     cfg = SimpleNamespace(rgba_dir=rgba_dir, positions_csv=csv_path, initial_mesh_path=stl_path, min_usable_frames=1)
     contract = validate_inputs(cfg)
-    dataset = RGBADataset(contract, 8)
 
     import src.camera_fitting as camera_fitting
 
@@ -63,33 +61,34 @@ def test_alpha_preload_opens_each_frame_once(tmp_path: Path, monkeypatch) -> Non
         return original(*args, **kwargs)
 
     monkeypatch.setattr(camera_fitting, "load_alpha_with_layout", counted)
-    cache = preload_camera_fit_alpha(dataset, 4, torch.device("cpu"))
-    assert cache.alphas.shape == (2, 4, 4, 1)
-    assert calls == 2
-    _ = cache.batch([0, 1])
-    _ = cache.batch([0, 1])
+    data, _ = _load_camera_fit_data(contract, 4)
+    assert data.alphas[0].shape == (4, 4)
     assert calls == 2
 
 
-def test_global_stage_parameter_sets_exclude_pose_parameters() -> None:
-    model = OpenScanCameraModel([0.0, 90.0], [0.0, 0.0], 2.7, 60.0, 2.0, 2.0, True, torch.device("cpu"))
-    model.set_global_trainable(True)
-    model.set_pose_trainable(False)
-    assert all(parameter.requires_grad for parameter in model.global_parameters())
-    assert not any(parameter.requires_grad for parameter in model.pose_parameters())
-
-
-def test_renderer_reuse_matches_single_camera_render() -> None:
-    from pytorch3d.renderer import FoVPerspectiveCameras, look_at_view_transform
-    from pytorch3d.structures import Meshes
-
-    mesh = Meshes(
-        verts=[torch.tensor([[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]])],
-        faces=[torch.tensor([[0, 1, 2]])],
+def test_fast_renderer_known_triangle_is_deterministic() -> None:
+    mesh = FastMesh(
+        vertices=np.array([[-0.5, -0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.5, 0.0]]),
+        faces=np.array([[0, 1, 2]], dtype=np.int32),
     )
-    R, T = look_at_view_transform(dist=2.7, elev=0.0, azim=[0.0, 90.0])
-    cameras = FoVPerspectiveCameras(R=R, T=T)
-    renderer = ReconstructionRenderer(24, torch.device("cpu"), 2)
-    one = renderer.render_mask(mesh, FoVPerspectiveCameras(R=R[:1], T=T[:1]))
-    batch = renderer.render_mask(mesh, cameras)
-    assert torch.allclose(one, batch[:1], atol=1e-6)
+    renderer = FastSilhouetteRenderer(64)
+    camera = CameraParameters(distance=2.0, fov_deg=60.0)
+    first = renderer.render(mesh, camera, 0.0, 0.0)
+    second = renderer.render(mesh, camera, 0.0, 0.0)
+    rotated = renderer.render(mesh, camera, 90.0, 0.0)
+    assert np.array_equal(first, second)
+    assert first.sum() > 0
+    assert not np.array_equal(first, rotated)
+
+
+def test_convention_candidates_cover_axes_signs_and_orders() -> None:
+    conventions = candidate_conventions()
+    assert len(conventions) == 48
+    assert CameraConvention("Y", "X", 1, 1, "theta_then_phi") in conventions
+    assert CameraConvention("Y", "X", -1, -1, "phi_then_theta") in conventions
+
+
+def test_camera_fit_has_no_pytorch3d_rasterizer_dependency() -> None:
+    source = Path("src/camera_fitting.py").read_text()
+    assert "MeshRasterizer" not in source
+    assert "SoftSilhouetteShader" not in source

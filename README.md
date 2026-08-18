@@ -84,6 +84,7 @@ Gate 1 input validation
 ## Safety gates
 
 - Gate 1 rejects missing CSV rows, duplicate image names or positions, non-RGBA files, empty/fully opaque alpha, unreadable images, and incompatible aspect ratios.
+- The convention sanity gate stops before fitting when the best candidate is below `CAMERA_CONVENTION_MIN_MEDIAN_IOU`.
 - Gate 2 stops geometry optimization when median silhouette IoU is below `CAMERA_GATE_MIN_MEDIAN_IOU`.
 - Gate 3 requires at least `MIN_USABLE_FRAMES` and reports angular coverage.
 - Gate 4 stops if vertex displacement exceeds `MAX_VERTEX_DISPLACEMENT_RATIO` of the normalized object size.
@@ -91,13 +92,13 @@ Gate 1 input validation
 
 The STL is frozen during camera fitting and camera parameters are frozen during the standard geometry baseline. RGB loss and texture optimization are disabled by default.
 
-Camera fitting uses a separate low-resolution alpha cache. Stage A uses up to `CAMERA_FIT_MAX_FRAMES` deterministic representatives, then the Camera Fit Gate evaluates every usable frame. Optional pose refinement runs afterward with bounded corrections and a small number of epochs. The reconstruction resolution in `MAX_IMAGE_DIMENSION` is not used for camera fitting.
+Camera Fit is a standalone CPU stage and does not import PyTorch3D. It preloads low-resolution alpha masks, creates a camera-only proxy mesh, searches plausible OpenScan conventions, numerically fits global projection parameters, and performs optional bounded pose refinement. The final Camera Fit Gate still evaluates every validated frame. PyTorch3D is initialized only after this gate passes for geometry reconstruction.
 
 ## Aspect ratio and poses
 
-Images are uniformly resized only when `MAX_IMAGE_DIMENSION` requires it, then symmetrically padded to a fixed renderer canvas. They are never stretched to a square. The run records original/processed dimensions, scale, and padding in `validation.json`.
+Images are uniformly resized only when the relevant resolution limit requires it, then symmetrically padded to a fixed renderer canvas. They are never stretched to a square. The run records original/processed dimensions, scale, and padding in `validation.json`.
 
-The pose convention is isolated in `src/openscan_pose.py`: theta is the +Y turntable rotation, phi is the +X tilt rotation, and the object-to-equivalent-camera transformation is documented there. The CSV is always the pose source; image filesystem order is never used to invent poses.
+Pose conventions are isolated in `src/pose_conventions.py`. The camera stage searches axis, sign, and rotation-order hypotheses before fitting, then writes the selected result to `camera_fit/selected_convention.json`. The CSV is always the pose source; image filesystem order is never used to invent poses.
 
 ## Outputs
 
@@ -106,9 +107,15 @@ outputs/demo/
 ├── validation.json
 ├── run_config.json
 ├── camera_fit/
-│   ├── camera_parameters.json
+│   ├── convention_search.csv
 │   ├── frame_poses.csv
+│   ├── global_camera_parameters.json
 │   ├── metrics.json
+│   ├── profile.json
+│   ├── proxy_mesh.stl
+│   ├── proxy_mesh_stats.json
+│   ├── selected_convention.json
+│   ├── selected_frames.csv
 │   ├── profile.json
 │   ├── pose_convention.json
 │   ├── selected_frames.csv

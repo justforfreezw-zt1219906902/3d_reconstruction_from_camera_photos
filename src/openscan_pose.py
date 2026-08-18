@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from pytorch3d.renderer import FoVPerspectiveCameras, look_at_view_transform
+from pytorch3d.renderer import FoVPerspectiveCameras
+
+from .pose_conventions import CameraConvention, DEFAULT_CONVENTION
 
 
 @dataclass(frozen=True)
@@ -31,32 +33,39 @@ class OpenScanConvention:
 CONVENTION = OpenScanConvention()
 
 
-def _rotation_x(angle: torch.Tensor) -> torch.Tensor:
+def _axis_rotation(axis: str, angle: torch.Tensor) -> torch.Tensor:
     c, s = torch.cos(angle), torch.sin(angle)
     zeros = torch.zeros_like(angle)
     ones = torch.ones_like(angle)
-    return torch.stack(
-        [torch.stack([ones, zeros, zeros], -1), torch.stack([zeros, c, -s], -1), torch.stack([zeros, s, c], -1)], -2
-    )
+    if axis == "X":
+        rows = ([ones, zeros, zeros], [zeros, c, -s], [zeros, s, c])
+    elif axis == "Y":
+        rows = ([c, zeros, s], [zeros, ones, zeros], [-s, zeros, c])
+    elif axis == "Z":
+        rows = ([c, -s, zeros], [s, c, zeros], [zeros, zeros, ones])
+    else:
+        raise ValueError(f"Unknown rotation axis: {axis}")
+    return torch.stack([torch.stack(row, -1) for row in rows], -2)
 
 
-def _rotation_y(angle: torch.Tensor) -> torch.Tensor:
-    c, s = torch.cos(angle), torch.sin(angle)
-    zeros = torch.zeros_like(angle)
-    ones = torch.ones_like(angle)
-    return torch.stack(
-        [torch.stack([c, zeros, s], -1), torch.stack([zeros, ones, zeros], -1), torch.stack([-s, zeros, c], -1)], -2
-    )
-
-
-def object_rotation(theta_deg: torch.Tensor, phi_deg: torch.Tensor) -> torch.Tensor:
+def object_rotation(
+    theta_deg: torch.Tensor,
+    phi_deg: torch.Tensor,
+    convention: CameraConvention = DEFAULT_CONVENTION,
+) -> torch.Tensor:
     theta = torch.deg2rad(theta_deg)
     phi = torch.deg2rad(phi_deg)
-    return _rotation_y(theta) @ _rotation_x(phi)
+    theta_rotation = _axis_rotation(convention.theta_axis, convention.theta_sign * theta)
+    phi_rotation = _axis_rotation(convention.phi_axis, convention.phi_sign * phi)
+    return theta_rotation @ phi_rotation if convention.rotation_order == "theta_then_phi" else phi_rotation @ theta_rotation
 
 
-def inverse_object_rotation(theta_deg: torch.Tensor, phi_deg: torch.Tensor) -> torch.Tensor:
-    return object_rotation(theta_deg, phi_deg).transpose(-1, -2)
+def inverse_object_rotation(
+    theta_deg: torch.Tensor,
+    phi_deg: torch.Tensor,
+    convention: CameraConvention = DEFAULT_CONVENTION,
+) -> torch.Tensor:
+    return object_rotation(theta_deg, phi_deg, convention).transpose(-1, -2)
 
 
 def _inverse_sigmoid(value: float) -> float:
@@ -66,6 +75,10 @@ def _inverse_sigmoid(value: float) -> float:
 
 def _inverse_softplus(value: float) -> float:
     return math.log(math.expm1(max(value, 1e-5)))
+
+
+def _inverse_bounded(value: float, bound: float) -> float:
+    return math.atanh(max(-0.99999, min(0.99999, value / max(bound, 1e-8))))
 
 
 class OpenScanCameraModel(torch.nn.Module):
@@ -79,18 +92,19 @@ class OpenScanCameraModel(torch.nn.Module):
         max_phi_delta_deg: float,
         pose_refine: bool,
         device: torch.device,
+        convention: CameraConvention = DEFAULT_CONVENTION,
     ) -> None:
         super().__init__()
         self.register_buffer("theta_commanded", torch.tensor(theta_deg, dtype=torch.float32, device=device))
         self.register_buffer("phi_commanded", torch.tensor(phi_deg, dtype=torch.float32, device=device))
-        base_r, _ = look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, device=device)
-        self.register_buffer("base_r", base_r[0])
+        self.register_buffer("base_r", torch.eye(3, dtype=torch.float32, device=device))
         self.raw_distance = torch.nn.Parameter(torch.tensor(_inverse_softplus(distance_initial), device=device))
         normalized_fov = (fov_initial - 10.0) / 110.0
         self.raw_fov = torch.nn.Parameter(torch.tensor(_inverse_sigmoid(normalized_fov), device=device))
         self.raw_x_offset = torch.nn.Parameter(torch.tensor(0.0, device=device))
         self.raw_y_offset = torch.nn.Parameter(torch.tensor(0.0, device=device))
         self.pose_refine = pose_refine
+        self.convention = convention
         self.max_theta_delta_deg = max_theta_delta_deg
         self.max_phi_delta_deg = max_phi_delta_deg
         self.raw_theta_delta = torch.nn.Parameter(torch.zeros(len(theta_deg), device=device), requires_grad=pose_refine)
@@ -106,11 +120,11 @@ class OpenScanCameraModel(torch.nn.Module):
 
     @property
     def x_offset(self) -> torch.Tensor:
-        return 0.5 * torch.tanh(self.raw_x_offset)
+        return torch.tanh(self.raw_x_offset)
 
     @property
     def y_offset(self) -> torch.Tensor:
-        return 0.5 * torch.tanh(self.raw_y_offset)
+        return torch.tanh(self.raw_y_offset)
 
     @property
     def theta_delta(self) -> torch.Tensor:
@@ -127,7 +141,7 @@ class OpenScanCameraModel(torch.nn.Module):
             indices = torch.tensor(indices, dtype=torch.long, device=self.theta_commanded.device)
         theta = self.theta_commanded[indices] + self.theta_delta[indices]
         phi = self.phi_commanded[indices] + self.phi_delta[indices]
-        rotations = object_rotation(theta, phi)
+        rotations = object_rotation(theta, phi, self.convention)
         R = self.base_r.unsqueeze(0) @ rotations
         zeros = torch.zeros(len(indices), dtype=R.dtype, device=R.device)
         T = torch.stack([zeros, zeros, self.distance.expand(len(indices))], dim=-1)
@@ -189,7 +203,7 @@ class OpenScanCameraModel(torch.nn.Module):
             "pose_refine": self.pose_refine,
             "max_theta_delta_deg": self.max_theta_delta_deg,
             "max_phi_delta_deg": self.max_phi_delta_deg,
-            "convention": CONVENTION.__dict__,
+            "convention": self.convention.as_dict(),
         }
 
     def freeze(self) -> None:
@@ -210,7 +224,24 @@ class OpenScanCameraModel(torch.nn.Module):
         for parameter in self.pose_parameters():
             parameter.requires_grad_(enabled and self.pose_refine)
 
+    def set_fitted_parameters(
+        self,
+        camera: dict,
+        theta_deltas: list[float],
+        phi_deltas: list[float],
+    ) -> None:
+        with torch.no_grad():
+            self.raw_distance.copy_(torch.tensor(_inverse_softplus(float(camera["distance"])), device=self.raw_distance.device))
+            normalized_fov = (float(camera["fov_deg"]) - 10.0) / 110.0
+            self.raw_fov.copy_(torch.tensor(_inverse_sigmoid(normalized_fov), device=self.raw_fov.device))
+            self.raw_x_offset.copy_(torch.tensor(_inverse_bounded(float(camera["principal_point_x_ndc"]), 1.0), device=self.raw_x_offset.device))
+            self.raw_y_offset.copy_(torch.tensor(_inverse_bounded(float(camera["principal_point_y_ndc"]), 1.0), device=self.raw_y_offset.device))
+            theta_values = [_inverse_bounded(float(value), self.max_theta_delta_deg) for value in theta_deltas]
+            phi_values = [_inverse_bounded(float(value), self.max_phi_delta_deg) for value in phi_deltas]
+            self.raw_theta_delta.copy_(torch.tensor(theta_values, dtype=self.raw_theta_delta.dtype, device=self.raw_theta_delta.device))
+            self.raw_phi_delta.copy_(torch.tensor(phi_values, dtype=self.raw_phi_delta.dtype, device=self.raw_phi_delta.device))
+
 
 def save_pose_convention(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(CONVENTION.__dict__, indent=2))
+    path.write_text(json.dumps(DEFAULT_CONVENTION.as_dict(), indent=2))
