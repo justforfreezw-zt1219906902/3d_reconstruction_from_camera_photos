@@ -93,7 +93,7 @@ Gate 1 input validation
 
 ## Development notes
 
-Use these CLI flags to run individual stages during development:
+Run `python main.py --help` to list the supported CLI flags. Use the following flags to run individual stages during development:
 
 - `--validate-only`: run Gate 1 input validation and stop before camera fitting or geometry reconstruction.
 - `--camera-fit-only`: run input validation, camera fitting, and Gate 2, then stop before geometry reconstruction.
