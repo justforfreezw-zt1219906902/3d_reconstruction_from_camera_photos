@@ -1,145 +1,107 @@
-# Reconstruction Architecture Refactor
+# Objective
 
-## Objective
+Separate camera/pose, global similarity alignment,
+and local deformation ownership.
 
-Refactor the reconstruction pipeline so that camera/pose parameters,
-global CAD-to-real alignment, and local geometry deformation have explicit
-and separate ownership.
+# Shared Constraints
 
-The main architectural problem to solve is that local per-vertex deformation
-must not absorb unresolved global rotation, translation, or scale errors.
+- preserve CLI
+- preserve positions.csv
+- preserve final.obj/final.stl
+- CAD is design prior
+...
 
-## Current problem
+# Workstream 1 — Camera and Pose Audit
 
-The current pipeline fits or selects camera parameters, freezes the camera,
-prepares the CAD proxy, and then optimizes mesh geometry.
+Type: review
+Mode: read-only
 
-The geometry optimizer currently exposes per-vertex offsets directly.
+Goal:
+Determine camera ownership and unresolved pose uncertainty.
 
-This allows local geometry deformation to compensate for errors that should
-belong to a global CAD-to-real alignment stage.
+Inspect:
+- src/pipeline.py
+- src/camera_fitting.py
+- src/openscan_pose.py
 
-## Target architecture
+Deliverable:
+Structured findings only. Do not modify production code.
 
-The intended optimization ownership is:
 
-Camera / Pose
-    ↓
-Global CAD-to-real Similarity Alignment
-    ↓
-Coarse / Fine / Local Geometry Deformation
-    ↓
-Final Mesh
+# Workstream 2 — Geometry Ownership Audit
 
-### Camera / Pose
+Type: review
+Mode: read-only
 
-Own camera projection and camera pose/calibration parameters.
+Goal:
+Determine where vertex offsets currently absorb global R/T/S.
 
-Camera uncertainty must remain conceptually separate from object geometry.
+Inspect:
+- src/optimizer.py
+- src/mesh_io.py
+- src/pipeline.py
 
-### Global alignment
+Deliverable:
+Ownership analysis and proposed boundary.
 
-Introduce an explicit CAD-to-real similarity transform with ownership of:
 
-- rotation
-- translation
-- uniform scale
+# Workstream 3 — Validation Design
 
-The transform should operate between CAD proxy preparation and local
-geometry deformation.
+Type: review
+Mode: read-only
 
-### Local deformation
+Goal:
+Define regression and synthetic validation before implementation.
 
-Local or per-vertex deformation should represent residual physical shape
-differences only after global alignment has been accounted for.
+Deliverable:
+Required tests and measurable acceptance criteria.
 
-## Scope
 
-Primary implementation areas are expected to include:
+# Workstream 4 — Similarity Alignment Implementation
 
-- `src/pipeline.py`
-- `src/optimizer.py`
-- `src/config.py`
+Type: implement
+Depends on:
+- Workstream 1
+- Workstream 2
+- Workstream 3
 
-A dedicated alignment module may be introduced, for example:
+Goal:
+Introduce explicit global R/T/S alignment.
 
-- `src/alignment.py`
+Preferred ownership:
+- src/alignment.py
+- tests/test_alignment.py
 
-Add or update tests as required.
 
-Do not assume these files must all change. Inspect the current repository
-before deciding the final implementation boundary.
+# Workstream 5 — Pipeline Integration
 
-## Required investigation
+Type: implement
+Depends on:
+- Workstream 4
 
-Before implementation, establish:
+Goal:
+Integrate:
 
-1. How camera parameters and pose conventions currently flow through the pipeline.
-2. Which camera parameters are frozen before geometry optimization.
-3. How the CAD proxy is normalized and transformed.
-4. Which variables the geometry optimizer currently owns.
-5. Where unresolved global rotation, translation, or scale can currently
-   leak into vertex offsets.
-6. Which existing tests constrain current behavior.
+Camera
+→ Global Alignment
+→ Local Deformation
 
-## Compatibility requirements
+Primary files:
+- src/pipeline.py
+- src/optimizer.py
+- src/config.py
 
-Preserve existing behavior and interfaces unless explicitly required by this
-refactor.
 
-In particular preserve:
+# Workstream 6 — Independent Verification
 
-- `main.py` as the CLI entry point
-- `positions.csv`
-- RGBA input handling
-- CAD/STL input handling
-- output directory conventions
-- `final.obj`
-- `final.stl`
+Type: review
+Depends on:
+- Workstream 5
 
-Preserve CLI behavior for:
+Run:
+- existing tests
+- alignment tests
+- CLI compatibility
+- export validation
 
-- `--validate-only`
-- `--camera-fit-only`
-- `--skip-camera-fit`
-
-## Validation requirements
-
-The completed implementation should provide evidence for at least:
-
-1. Existing relevant tests continue to pass.
-2. CLI compatibility is preserved.
-3. An identity global transform does not alter geometry.
-4. Synthetic known similarity transforms can be represented correctly.
-5. Global R/T/S parameters are explicitly separate from local vertex offsets.
-6. The final mesh export path remains operational.
-7. Critical final validation is run against the final candidate code.
-
-## Multi-agent execution strategy
-
-Use parallel agents primarily for independent investigation and verification.
-
-Recommended initial workstreams:
-
-- camera / pose audit
-- geometry / optimizer audit
-- validation and regression-test design
-
-Do not let multiple implementation agents concurrently edit the same core
-pipeline files.
-
-After investigation, perform implementation according to the dependency graph
-derived from the findings.
-
-Use an independent review or verification task after integration.
-
-## Completion criteria
-
-The task is complete when:
-
-- the ownership boundary is explicit in code;
-- global similarity alignment owns R/T/S;
-- local deformation owns residual shape change;
-- compatibility requirements remain satisfied;
-- tests and validation evidence support the final implementation;
-- the resulting implementation is committed to Git.
+Do not modify production code.
