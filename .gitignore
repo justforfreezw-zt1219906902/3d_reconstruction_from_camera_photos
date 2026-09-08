@@ -9,3 +9,4 @@ outputs/*
 .DS_Store
 /.forge/
 /AGENTS.md
+/CLAUDE.md
