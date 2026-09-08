@@ -91,6 +91,16 @@ Gate 1 input validation
 → OBJ/STL export
 ```
 
+## Development notes
+
+Use these CLI flags to run individual stages during development:
+
+- `--validate-only`: run Gate 1 input validation and stop before camera fitting or geometry reconstruction.
+- `--camera-fit-only`: run input validation, camera fitting, and Gate 2, then stop before geometry reconstruction.
+- `--skip-camera-fit`: skip camera fitting and reconstruct geometry using the commanded CSV poses and initial camera parameters.
+
+`--camera-fit-only` and `--skip-camera-fit` are mutually exclusive. `--validate-only` takes precedence over either flag when used in an otherwise valid combination.
+
 ## Safety gates
 
 - Gate 1 rejects missing CSV rows, duplicate image names or positions, non-RGBA files, empty/fully opaque alpha, unreadable images, and incompatible aspect ratios.
