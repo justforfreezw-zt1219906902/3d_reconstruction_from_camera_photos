@@ -31,10 +31,6 @@ global CAD-to-real alignment, and local geometry deformation.
 
 Use project-scoped Skills under `.agents/skills/` when relevant.
 
-For coding work:
 
-- use the repository-state Skill to inspect and protect the current Git state;
-- use `agent-state` for durable task lifecycle, Git SHA, engineering-decision,
-  and validation metadata.
 
 Do not duplicate Skill procedures in this file.
