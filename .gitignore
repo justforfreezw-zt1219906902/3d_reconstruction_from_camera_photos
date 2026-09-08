@@ -6,3 +6,4 @@ venv/
 outputs/*
 !outputs/.gitkeep
 /.agents/
+.DS_Store
