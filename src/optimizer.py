@@ -33,6 +33,27 @@ class ReconstructionResult:
     final_stl: Path
 
 
+def _local_offset_basis(vertices: torch.Tensor) -> torch.Tensor:
+    """Orthonormal global similarity modes for the single aligned mesh.
+
+    Orthogonality fixes centroid, scale and rotational moment relative to the
+    aligned reference. The safety gate keeps residuals in this local regime.
+    """
+    points = vertices.detach().reshape(-1, 3)
+    centered = points - points.mean(0)
+    axes = torch.eye(3, dtype=points.dtype, device=points.device)
+    modes = [axis.expand_as(points).reshape(-1) for axis in axes]
+    modes += [torch.linalg.cross(axis.expand_as(points), centered).reshape(-1) for axis in axes]
+    modes.append(centered.reshape(-1))
+    u, singular, _ = torch.linalg.svd(torch.stack(modes, dim=1), full_matrices=False)
+    return u[:, singular > singular.max() * 1e-6]
+
+
+def _project_local_offsets(offsets: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
+    flat = offsets.reshape(-1)
+    return (flat - basis @ (basis.T @ flat)).reshape_as(offsets)
+
+
 def _mesh_with_offsets(base_mesh: Meshes, offsets: torch.Tensor) -> Meshes:
     return base_mesh.update_padded(base_mesh.verts_padded() + offsets)
 
@@ -137,6 +158,11 @@ def train_geometry(
     print(f"  resolution: {dataset.canvas_size}")
     print(f"  faces per pixel: {cfg.silhouette_faces_per_pixel}")
 
+    # The reference already includes frozen global alignment. No camera or
+    # alignment parameters belong to this optimizer.
+    base_mesh = base_mesh.detach()
+    camera_model.freeze()
+    local_basis = _local_offset_basis(base_mesh.verts_padded())
     offsets = torch.zeros_like(base_mesh.verts_padded(), device=device, requires_grad=True)
     optimizer = torch.optim.Adam([offsets], lr=cfg.opt_lr_verts)
     losses_path = reconstruction_dir / "losses.csv"
@@ -145,7 +171,8 @@ def train_geometry(
     best_loss = float("inf")
     stale_epochs = 0
     previous_valid_offsets = offsets.detach().clone()
-    object_size = transform.normalized_object_size
+    vertices = base_mesh.verts_packed()
+    object_size = float(torch.linalg.vector_norm(vertices.max(0).values - vertices.min(0).values).cpu())
     representative = set(dataset.representative_indices())
     usage_counts = [0] * len(dataset)
     timing = {"render": [], "regularization": [], "backward": []}
@@ -165,7 +192,7 @@ def train_geometry(
             target_rgb = torch.stack([sample.image for sample in samples]).to(device)
             target_alpha = torch.stack([sample.alpha for sample in samples]).to(device)
             cameras = camera_model.cameras(batch)
-            mesh = _mesh_with_offsets(base_mesh, offsets)
+            mesh = _mesh_with_offsets(base_mesh, _project_local_offsets(offsets, local_basis))
 
             render_started = time.perf_counter()
             rendered_alpha = renderer.render_mask(mesh, cameras)
@@ -196,6 +223,8 @@ def train_geometry(
             if offsets.grad is None or not torch.isfinite(offsets.grad).all():
                 raise ReconstructionGateError("GATE 5 — OPTIMIZATION HEALTH FAILED: vertex gradient is NaN/Inf.")
             optimizer.step()
+            with torch.no_grad():
+                offsets.copy_(_project_local_offsets(offsets, local_basis))
             timing["backward"].append(time.perf_counter() - backward_started)
 
             values = {

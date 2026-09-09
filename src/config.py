@@ -107,6 +107,10 @@ class Config:
     scale_normalize: bool
     silhouette_faces_per_pixel: int
 
+    alignment_enabled: bool = True
+    alignment_epochs: int = 10
+    alignment_lr: float = 0.01
+
     def as_dict(self) -> dict:
         data = asdict(self)
         for key in ("initial_mesh_path", "rgba_dir", "positions_csv", "output_dir"):
@@ -119,6 +123,9 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
     runtime_profile = os.getenv("RUNTIME_PROFILE", "custom").strip().lower()
     profile = runtime_profile_defaults(runtime_profile)
     cfg = Config(
+        alignment_enabled=_bool("ALIGNMENT_ENABLED", True),
+        alignment_epochs=_int("ALIGNMENT_EPOCHS", 10),
+        alignment_lr=_float("ALIGNMENT_LR", 0.01),
         initial_mesh_path=_path("INITIAL_MESH_PATH", "/absolute/path/to/reference.stl"),
         rgba_dir=_path("RGBA_DIR", "./dataset/rgba"),
         positions_csv=_path("POSITIONS_CSV", "./dataset/positions.csv"),
@@ -162,6 +169,8 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         scale_normalize=_bool("MESH_SCALE_NORMALIZE", True),
         silhouette_faces_per_pixel=int(_profile_value("SILHOUETTE_FACES_PER_PIXEL", profile, "silhouette_faces_per_pixel", 20)),
     )
+    if cfg.alignment_epochs <= 0 or not np.isfinite(cfg.alignment_lr) or cfg.alignment_lr <= 0:
+        raise ValueError("ALIGNMENT_EPOCHS and ALIGNMENT_LR must be positive and finite.")
     if cfg.max_image_dimension <= 0:
         raise ValueError("MAX_IMAGE_DIMENSION must be positive.")
     if cfg.camera_fit_max_dimension <= 0:

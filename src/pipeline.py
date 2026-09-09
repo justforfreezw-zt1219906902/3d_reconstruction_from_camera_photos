@@ -42,6 +42,50 @@ def _build_geometry_model(contract: DatasetContract, cfg: Config, device, camera
     return model
 
 
+def _fit_global_alignment(mesh, dataset, camera_model, renderer, cfg, device, output_dir):
+    """Fit only global R/T/S in normalized coordinates with frozen cameras."""
+    import torch
+    from .alignment import GlobalSimilarityAlignment, SimilarityTransform
+    from .losses import alpha_silhouette_loss
+    from .optimizer import select_geometry_view_indices, _batch_indices
+
+    camera_model.freeze()
+    vertices = mesh.verts_padded().detach()
+    alignment = GlobalSimilarityAlignment(
+        SimilarityTransform.identity(dtype=vertices.dtype, device=device)
+    )
+    optimizer = torch.optim.Adam(alignment.parameters(), lr=cfg.alignment_lr)
+    for epoch in range(1, cfg.alignment_epochs + 1) if cfg.alignment_enabled else ():
+        indices = select_geometry_view_indices(
+            dataset.frames, cfg.geometry_views_per_epoch, epoch, cfg.seed
+        )
+        # Accumulate all selected views before a global update, keeping memory
+        # bounded by the existing render batch size.
+        optimizer.zero_grad(set_to_none=True)
+        for batch in _batch_indices(indices, cfg.geometry_view_batch_size):
+            target = torch.stack([dataset[i].alpha for i in batch]).to(device)
+            aligned = mesh.update_padded(alignment(vertices))
+            rendered = renderer.render_mask(aligned, camera_model.cameras(batch))
+            loss = alpha_silhouette_loss(rendered, target)
+            if not torch.isfinite(loss) or rendered.detach().sum() <= 0:
+                raise RuntimeError("Global alignment failed: non-finite loss or empty silhouette.")
+            (loss * len(batch) / len(indices)).backward()
+        if any(p.grad is None or not torch.isfinite(p.grad).all() for p in alignment.parameters()):
+            raise RuntimeError("Global alignment failed: missing or non-finite gradient.")
+        optimizer.step()
+    alignment.requires_grad_(False)
+    fitted = alignment.as_transform()
+    metadata = {
+        "enabled": cfg.alignment_enabled,
+        "coordinate_frame": "normalized_object",
+        "rotation": fitted.rotation.cpu().tolist(),
+        "translation": fitted.translation.cpu().tolist(),
+        "scale": float(fitted.scale.cpu()),
+    }
+    (output_dir / "global_alignment.json").write_text(json.dumps(metadata, indent=2))
+    return mesh.update_padded(fitted.apply(vertices).detach())
+
+
 def run_demo(
     cfg: Config,
     contract: DatasetContract,
@@ -161,6 +205,11 @@ def run_demo(
             renderer.probe(geometry_mesh, camera_model.cameras([0]))
         else:
             raise
+    # Camera -> Global Alignment -> Local Deformation. Apply exactly once,
+    # after device fallback, and detach before allocating local offsets.
+    geometry_mesh = _fit_global_alignment(
+        geometry_mesh, dataset, camera_model, renderer, cfg, device, reconstruction_dir
+    )
     geometry_result = train_geometry(
         geometry_mesh,
         transform,
