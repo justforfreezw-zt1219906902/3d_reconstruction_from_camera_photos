@@ -3,9 +3,10 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+import pytest
 import torch
 
-from src.mesh_io import export_mesh_stl, load_initial_mesh, restore_vertices
+from src.mesh_io import export_mesh_obj, export_mesh_stl, load_initial_mesh, restore_vertices
 
 
 def _write_triangle_stl(path: Path) -> None:
@@ -27,3 +28,17 @@ def test_stl_load_normalize_restore_and_export(tmp_path: Path) -> None:
     output = tmp_path / "final.stl"
     export_mesh_stl(mesh, output, transform)
     assert output.exists()
+
+
+@pytest.mark.parametrize('extension,exporter', [('obj', export_mesh_obj), ('stl', export_mesh_stl)])
+@pytest.mark.parametrize('normalize', [False, True])
+def test_mesh_export_round_trip(tmp_path, extension, exporter, normalize):
+    source = tmp_path / 'source.stl'
+    _write_triangle_stl(source)
+    mesh, transform = load_initial_mesh(source, torch.device('cpu'), normalize, normalize)
+    output = tmp_path / f'final.{extension}'
+    exporter(mesh, output, transform)
+    reloaded, _ = load_initial_mesh(output, torch.device('cpu'), False, False)
+    expected = restore_vertices(mesh.verts_packed(), transform)[mesh.faces_packed()]
+    actual = reloaded.verts_packed()[reloaded.faces_packed()]
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)

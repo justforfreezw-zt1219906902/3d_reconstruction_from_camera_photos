@@ -111,6 +111,15 @@ class Config:
     alignment_epochs: int = 10
     alignment_lr: float = 0.01
 
+    # Conservative local-only controls relative to the frozen aligned CAD prior:
+    # unit anchor weight retains reference proximity; modest smoothness weight
+    # discourages isolated offsets without dominating the reference penalty.
+    loss_anchor_weight: float = 1.0
+    loss_local_smoothness_weight: float = 0.1
+    # Limit residual motion to 3% of object size; hold out 20% of geometry views.
+    max_local_deformation_ratio: float = 0.03
+    geometry_validation_fraction: float = 0.20
+
     def as_dict(self) -> dict:
         data = asdict(self)
         for key in ("initial_mesh_path", "rgba_dir", "positions_csv", "output_dir"):
@@ -158,6 +167,10 @@ def load_config(env_file: Optional[str | Path] = None) -> Config:
         loss_laplacian_weight=_float("LOSS_LAPLACIAN_WEIGHT", 0.1),
         loss_edge_weight=_float("LOSS_EDGE_WEIGHT", 0.1),
         loss_normal_weight=_float("LOSS_NORMAL_WEIGHT", 0.01),
+        loss_anchor_weight=_float("LOSS_ANCHOR_WEIGHT", 1.0),
+        loss_local_smoothness_weight=_float("LOSS_LOCAL_SMOOTHNESS_WEIGHT", 0.1),
+        max_local_deformation_ratio=_float("MAX_LOCAL_DEFORMATION_RATIO", 0.03),
+        geometry_validation_fraction=_float("GEOMETRY_VALIDATION_FRACTION", 0.20),
         max_vertex_displacement_ratio=_float("MAX_VERTEX_DISPLACEMENT_RATIO", 0.10),
         min_usable_frames=_int("MIN_USABLE_FRAMES", 20),
         export_every_epochs=_int("EXPORT_EVERY_EPOCHS", 5),

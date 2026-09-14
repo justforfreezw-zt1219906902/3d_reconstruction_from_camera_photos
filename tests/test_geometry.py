@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,9 +9,9 @@ import pytest
 import torch
 from PIL import Image
 
-from src.config import load_config, runtime_profile_defaults, select_device
+from src.config import Config, load_config, runtime_profile_defaults, select_device
 from src.fast_silhouette import FastMesh, create_camera_proxy
-from src.optimizer import select_geometry_view_indices
+from src.optimizer import select_geometry_view_indices, split_geometry_view_indices
 from src.visualization import save_stage_preview
 
 
@@ -80,6 +81,43 @@ def test_geometry_view_sampling_rotates_and_covers_phi_theta() -> None:
     assert first != second
 
 
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 7, 336])
+@pytest.mark.parametrize("fraction", [0.001, 0.2, 0.99])
+def test_geometry_split_small_and_large_datasets(count, fraction) -> None:
+    import random
+    frames = [SimpleNamespace() for _ in range(count)]
+    state = random.getstate()
+    train, validation = split_geometry_view_indices(frames, 42, fraction)
+    assert random.getstate() == state
+    assert (train, validation) == split_geometry_view_indices(frames, 42, fraction)
+    assert set(train).isdisjoint(validation)
+    assert sorted(train + validation) == list(range(count))
+    if count >= 2:
+        assert train and validation
+        assert len(validation) == min(count - 1, max(1, round(count * fraction)))
+    else:
+        assert train == list(range(count)) and validation == []
+    assert set(select_geometry_view_indices([frames[i] for i in train], 0, 1, 42)) == set(range(len(train)))
+
+
+def test_geometry_split_angular_coverage_and_seed() -> None:
+    frames = [SimpleNamespace(phi_deg=phi, theta_deg=theta)
+              for phi in (-30, 0, 30) for theta in range(0, 360, 10)]
+    train, validation = split_geometry_view_indices(frames, 42, 0.2)
+    assert validation != split_geometry_view_indices(frames, 43, 0.2)[1]
+    for indices in (train, validation):
+        assert {frames[i].phi_deg for i in indices} == {-30, 0, 30}
+        for phi in (-30, 0, 30):
+            angles = sorted(frames[i].theta_deg for i in indices if frames[i].phi_deg == phi)
+            assert max(b - a for a, b in zip(angles, angles[1:] + [angles[0] + 360])) <= 100
+
+
+@pytest.mark.parametrize("fraction", [0, 1, -0.1, 1.1, float("nan"), float("inf")])
+def test_geometry_split_rejects_invalid_fraction(fraction) -> None:
+    with pytest.raises(ValueError, match="GEOMETRY_VALIDATION_FRACTION"):
+        split_geometry_view_indices([SimpleNamespace()] * 3, 42, fraction)
+
+
 def test_preview_creates_parent_directory(tmp_path: Path) -> None:
     image = torch.ones(1, 8, 8, 3)
     alpha = torch.ones(1, 8, 8, 1)
@@ -90,7 +128,7 @@ def test_preview_creates_parent_directory(tmp_path: Path) -> None:
 
 def test_regularization_is_outside_view_loop() -> None:
     source = Path("src/optimizer.py").read_text()
-    assert source.count("regs = regularization_losses(mesh)") == 1
+    assert source.count("regs = regularization_losses(mesh, base_mesh)") == 1
     assert "for step, batch in enumerate" in source
 
 
@@ -201,3 +239,422 @@ def test_local_training_exports_aligned_mesh(monkeypatch: pytest.MonkeyPatch, tm
         loaded, _ = load_initial_mesh(path, device, center_normalize=False, scale_normalize=False)
         # STL may reorder vertices; compare by nearest corresponding position.
         assert torch.cdist(expected, loaded.verts_packed()).min(1).values.max() < 1e-5
+
+
+@pytest.mark.parametrize("legacy_env", [False, True])
+def test_reference_deformation_config_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, legacy_env: bool) -> None:
+    monkeypatch.setattr(os, "environ", {})
+    env_file = tmp_path / "config.env"
+    env_file.write_text(f"OUTPUT_DIR={tmp_path / 'outputs'}\n" + ("NUM_EPOCHS=7\n" if legacy_env else ""))
+    cfg = load_config(env_file)
+    expected = {
+        "loss_anchor_weight": 1.0,
+        "loss_local_smoothness_weight": 0.1,
+        "max_local_deformation_ratio": 0.03,
+        "geometry_validation_fraction": 0.20,
+    }
+    for key, value in expected.items():
+        assert getattr(cfg, key) == value
+        assert cfg.as_dict()[key] == value
+    # Older direct constructors can omit the newly introduced fields too.
+    old_fields = {key: value for key, value in vars(cfg).items() if key not in expected}
+    assert Config(**old_fields) == cfg
+    assert cfg.num_epochs == (7 if legacy_env else 50)
+    unchanged = {
+        "camera_distance_initial": 2.7, "camera_fov_initial": 60.0,
+        "camera_fit_enabled": True, "camera_fit_max_dimension": 128,
+        "camera_fit_max_faces": 3000, "camera_fit_max_frames": 12,
+        "camera_fit_max_evaluations": 200,
+        "camera_convention_min_median_iou": 0.20, "camera_gate_min_median_iou": 0.50,
+        "pose_refine": True, "pose_refine_epochs": 3,
+        "max_theta_delta_deg": 2.0, "max_phi_delta_deg": 2.0,
+        "alignment_enabled": True, "alignment_epochs": 10, "alignment_lr": 0.01,
+        "max_vertex_displacement_ratio": 0.10,
+    }
+    for key, value in unchanged.items():
+        assert getattr(cfg, key) == value
+
+
+def test_reference_deformation_config_env_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os, "environ", {})
+    env_file = tmp_path / "config.env"
+    overrides = {
+        "LOSS_ANCHOR_WEIGHT": 2.0,
+        "LOSS_LOCAL_SMOOTHNESS_WEIGHT": 0.25,
+        "MAX_LOCAL_DEFORMATION_RATIO": 0.02,
+        "GEOMETRY_VALIDATION_FRACTION": 0.15,
+    }
+    env_file.write_text(
+        f"OUTPUT_DIR={tmp_path / 'outputs'}\n"
+        + "\n".join(f"{key}={value}" for key, value in overrides.items())
+    )
+    cfg = load_config(env_file)
+    for key, value in overrides.items():
+        assert getattr(cfg, key.lower()) == value
+        assert cfg.as_dict()[key.lower()] == value
+    # Existing process environment takes precedence over dotenv values.
+    for key in overrides:
+        monkeypatch.setenv(key, "0.01")
+    cfg = load_config(env_file)
+    for key in overrides:
+        assert getattr(cfg, key.lower()) == 0.01
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.001, 0.03])
+def test_bounded_offsets_preserve_local_modes_and_gradients(ratio: float) -> None:
+    from src.optimizer import _bounded_local_offsets, _local_offset_basis, _displacement_stats
+    vertices = torch.tensor([[[-1., -1., -1.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]]])
+    basis = _local_offset_basis(vertices)
+    size = float(torch.linalg.vector_norm(vertices.amax(1) - vertices.amin(1)))
+    raw = (torch.arange(12.).reshape_as(vertices).sin() * 100).requires_grad_()
+    bounded = _bounded_local_offsets(raw, basis, size * ratio)
+    assert _displacement_stats(bounded, size)["max_vertex_displacement_ratio"] <= ratio
+    assert torch.allclose(basis.T @ bounded.flatten(), torch.zeros(basis.shape[1]), atol=1e-6)
+    bounded.square().sum().backward()
+    assert torch.isfinite(raw.grad).all()
+    zero = torch.zeros_like(raw, requires_grad=True)
+    _bounded_local_offsets(zero, basis, size * ratio).sum().backward()
+    assert torch.isfinite(zero.grad).all()
+
+
+@pytest.mark.parametrize("emergency_limit", [0.1, 0.0001])
+@pytest.mark.parametrize("view_count,view_limit,batch_size", [(2, 0, 1), (9, 3, 2), (9, 0, 4)])
+def test_training_bounds_every_mesh_and_weights_reference_losses(monkeypatch, tmp_path, emergency_limit, view_count, view_limit, batch_size) -> None:
+    import csv
+    import json
+    from dataclasses import replace
+    import src.optimizer as module
+    from src.mesh_io import mesh_from_arrays, _normalize_mesh
+
+    vertices = torch.tensor([[-1., -1., -1.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
+    mesh = mesh_from_arrays(vertices, torch.tensor([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]]), torch.device("cpu"))
+    mesh, transform = _normalize_mesh(mesh, True, True)
+    reference = mesh.verts_packed().clone()
+    size = float(torch.linalg.vector_norm(reference.amax(0) - reference.amin(0)))
+    class Dataset:
+        frames = [SimpleNamespace(phi_deg=0., theta_deg=i * 360 / view_count, image=f"{i}.png") for i in range(view_count)]
+        canvas_size = (4, 3)
+        def __len__(self):
+            return view_count
+        def __getitem__(self, index):
+            return SimpleNamespace(alpha=torch.ones(4, 3), image=torch.ones(4, 3))
+        def representative_indices(self):
+            return list(range(view_count))
+    observed = []
+    gradient_views, backward_views, preview_views = set(), set(), set()
+    def check_mesh(current):
+        displacement = current.verts_packed().detach() - reference
+        assert module._displacement_stats(displacement, size)["max_vertex_displacement_ratio"] <= 0.03
+        observed.append(displacement.clone())
+    def render(current, cameras):
+        check_mesh(current)
+        result = current.verts_padded().sigmoid().expand(len(cameras), -1, -1)
+        if torch.is_grad_enabled():
+            gradient_views.update(cameras)
+            result.register_hook(lambda grad: backward_views.update(cameras))
+        else:
+            preview_views.update(cameras)
+        return result
+    exports = []
+    def export(current, path, transform):
+        check_mesh(current)
+        exports.append(path.name)
+    monkeypatch.setattr(module, "export_mesh_obj", export)
+    monkeypatch.setattr(module, "export_mesh_stl", export)
+    monkeypatch.setattr(module, "save_stage_preview", lambda *args: None)
+    monkeypatch.setattr(module, "plot_losses", lambda *args: None)
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
+    cfg = replace(load_config(tmp_path / "missing.env"), num_epochs=3, geometry_views_per_epoch=view_limit,
+                  geometry_view_batch_size=batch_size, opt_lr_verts=10., loss_rgb_weight=0.,
+                  loss_normal_weight=0., loss_anchor_weight=2.3, loss_local_smoothness_weight=0.7,
+                  max_local_deformation_ratio=0.03, max_vertex_displacement_ratio=emergency_limit,
+                  export_every_epochs=1, save_preview_every_epochs=1, early_stopping_patience=0)
+    def train():
+        return module.train_geometry(mesh, transform, Dataset(),
+            SimpleNamespace(freeze=lambda: None, cameras=lambda batch: batch),
+            SimpleNamespace(render_mask=render), cfg, torch.device("cpu"), tmp_path)
+    if emergency_limit < cfg.max_local_deformation_ratio:
+        with pytest.raises(module.ReconstructionGateError, match="DEFORMATION SAFETY"):
+            train()
+        saved = torch.load(tmp_path / "reconstruction/checkpoints/last_valid_checkpoint.pt", weights_only=True)
+        assert torch.count_nonzero(saved["offsets"]) == 0
+        assert not exports
+        return
+    result = train()
+    split = json.loads((tmp_path / "reconstruction/view_split.json").read_text())
+    training, validation = split_geometry_view_indices(Dataset.frames, cfg.seed, cfg.geometry_validation_fraction)
+    assert split["training_indices"] == training
+    assert split["validation_indices"] == validation
+    assert gradient_views and backward_views == gradient_views
+    assert gradient_views <= set(training)
+    assert gradient_views.isdisjoint(validation)
+    assert set(validation) <= preview_views
+    usage = list(csv.DictReader((tmp_path / "reconstruction/view_usage.csv").open()))
+    assert all(int(usage[i]["usage_count"]) == 0 for i in validation)
+    check_mesh(result.mesh)
+    assert "final.obj" in exports and "final.stl" in exports
+    assert any(torch.count_nonzero(offset) for offset in observed)
+    rows = list(csv.DictReader((tmp_path / "reconstruction/losses.csv").open()))
+    assert len(rows) == 3
+    for row in rows:
+        required = {"epoch", "total", "silhouette", "rgb", "normal", "iou",
+                    "training_objective", "training_silhouette", "training_iou",
+                    "validation_silhouette", "validation_iou", "anchor", "local_smoothness",
+                    "mean_vertex_displacement", "median_vertex_displacement",
+                    "p95_vertex_displacement", "max_vertex_displacement",
+                    "max_vertex_displacement_ratio", "best_epoch", "is_best"}
+        assert required <= row.keys()
+        assert all(np.isfinite(float(row[key])) for key in required)
+        for explicit, legacy in [("training_objective", "total"),
+                                 ("training_silhouette", "silhouette"), ("training_iou", "iou")]:
+            assert row[explicit] == row[legacy]
+        expected = (cfg.loss_silhouette_weight * float(row["silhouette"])
+                    + 2.3 * float(row["anchor"]) + 0.7 * float(row["local_smoothness"]))
+        assert float(row["total"]) == pytest.approx(expected, rel=1e-6)
+        assert float(row["max_vertex_displacement_ratio"]) <= 0.03
+    assert float(rows[-1]["anchor"]) > 0
+    assert float(rows[-1]["local_smoothness"]) > 0
+    for path in (tmp_path / "reconstruction/checkpoints").glob("*.pt"):
+        saved = torch.load(path, weights_only=True)
+        assert module._displacement_stats(saved["offsets"], size)["max_vertex_displacement_ratio"] <= 0.03
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.001, 0.017])
+def test_configured_bound_survives_rendering_and_real_exports(monkeypatch, tmp_path, ratio) -> None:
+    """Oversized optimizer steps must never escape through previews or mesh files."""
+    import json
+    from dataclasses import replace
+    import src.optimizer as module
+    from src.mesh_io import mesh_from_arrays, _normalize_mesh, load_initial_mesh, restore_vertices
+
+    device = torch.device("cpu")
+    vertices = torch.tensor([[-1., -1., -1.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]]) * 7 + 12
+    faces = torch.tensor([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]])
+    mesh, transform = _normalize_mesh(mesh_from_arrays(vertices, faces, device), True, True)
+    reference = mesh.verts_packed().clone()
+    size = torch.linalg.vector_norm(reference.amax(0) - reference.amin(0)).item()
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setenv("MAX_LOCAL_DEFORMATION_RATIO", str(ratio))
+    cfg = replace(load_config(tmp_path / "missing.env"), num_epochs=2, opt_lr_verts=10.,
+                  geometry_views_per_epoch=0, geometry_view_batch_size=8, seed=713,
+                  loss_rgb_weight=0., loss_normal_weight=0., loss_anchor_weight=0.,
+                  loss_local_smoothness_weight=0., max_vertex_displacement_ratio=1.,
+                  export_every_epochs=1, save_preview_every_epochs=1, early_stopping_patience=0)
+    assert cfg.max_local_deformation_ratio == ratio
+
+    class Dataset:
+        frames = [SimpleNamespace(phi_deg=0., theta_deg=i * 180., image=f"{i}.png") for i in range(2)]
+        canvas_size = (4, 3)
+        def __len__(self):
+            return 2
+        def __getitem__(self, index):
+            return SimpleNamespace(alpha=torch.ones(4, 3), image=torch.ones(4, 3))
+        def representative_indices(self):
+            return [0, 1]
+
+    rendered_ratios = []
+    def render(current, cameras):
+        # Measure actual vertices independently of the production statistics helper.
+        actual = (current.verts_packed().detach() - reference).norm(dim=-1).max().item() / size
+        assert actual <= ratio + 1e-7
+        rendered_ratios.append(actual)
+        return current.verts_padded().sigmoid().expand(len(cameras), -1, -1)
+
+    monkeypatch.setattr(module, "save_stage_preview", lambda *args: None)
+    monkeypatch.setattr(module, "plot_losses", lambda *args: None)
+    splits = []
+    for run in range(2):
+        # Perturb ambient randomness: cfg.seed alone must determine the split.
+        import random
+        state = random.getstate()
+        try:
+            random.seed(100 + run)
+            result = module.train_geometry(mesh, transform, Dataset(),
+                SimpleNamespace(freeze=lambda: None, cameras=lambda batch: batch),
+                SimpleNamespace(render_mask=render), cfg, device, tmp_path / str(run))
+        finally:
+            random.setstate(state)
+        folder = tmp_path / str(run) / "reconstruction"
+        split = json.loads((folder / "view_split.json").read_text())
+        train, validation = split["training_indices"], split["validation_indices"]
+        assert train and validation
+        assert set(train).isdisjoint(validation)
+        assert sorted(train + validation) == [0, 1]
+        splits.append((train, validation))
+        assert (result.mesh.verts_packed() - reference).norm(dim=-1).max().item() / size <= ratio + 1e-7
+        paths = list(folder.rglob("*.obj")) + list(folder.rglob("*.stl"))
+        assert len(paths) == 6  # Two epoch exports and final export, in both formats.
+        raw_reference = restore_vertices(reference, transform)
+        raw_size = size * transform.scale
+        for path in paths:
+            loaded, _ = load_initial_mesh(path, device, center_normalize=False, scale_normalize=False)
+            # STL can reorder/deduplicate vertices; every exported point must be bounded.
+            distances = torch.cdist(loaded.verts_packed(), raw_reference)
+            assert distances.min(dim=1).values.max().item() / raw_size <= ratio + 1e-6
+            assert distances.min(dim=0).values.max().item() / raw_size <= ratio + 1e-6
+    assert splits[0] == splits[1]
+    assert rendered_ratios
+    if ratio:
+        assert max(rendered_ratios) > ratio * 0.9  # Ensure the hard limit was exercised.
+
+
+def test_best_geometry_comparison() -> None:
+    from src.optimizer import is_better_geometry_state as better
+    best = dict(validation_silhouette=.2, validation_iou=.6,
+                mean_vertex_displacement=.02, p95_vertex_displacement=.03)
+    assert better(best, None, constraints_satisfied=True)
+    assert not better(best, None, constraints_satisfied=False)
+    assert not better(best, best, constraints_satisfied=True)
+    for changes, expected in [
+        ({'validation_silhouette': .1, 'mean_vertex_displacement': .03}, True),
+        ({'validation_silhouette': .3, 'mean_vertex_displacement': .01}, False),
+        ({'validation_iou': .7}, True), ({'validation_iou': .5}, False),
+        ({'validation_silhouette': .2000001, 'mean_vertex_displacement': .01}, True),
+        ({'p95_vertex_displacement': .02}, True),
+        ({'mean_vertex_displacement': .03, 'p95_vertex_displacement': .01}, False),
+        ({'validation_silhouette': float('nan')}, False),
+        ({'p95_vertex_displacement': float('inf')}, False),
+    ]:
+        candidate = {**best, **changes}
+        assert better(candidate, best, constraints_satisfied=True) == expected
+        assert not better(candidate, best, constraints_satisfied=False)
+
+
+def test_validation_no_grad_and_view_weighting() -> None:
+    from src.optimizer import evaluate_geometry_validation
+    from pytorch3d.structures import Meshes
+    vertices = torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]])
+    mesh = Meshes(verts=[vertices], faces=[torch.tensor([[0, 1, 2]])])
+    offsets = torch.zeros_like(mesh.verts_padded(), requires_grad=True)
+    offsets.grad = torch.ones_like(offsets)
+    before, gradient = offsets.detach().clone(), offsets.grad.clone()
+    calls = []
+    class Dataset:
+        def __getitem__(self, index):
+            assert not torch.is_grad_enabled()
+            return SimpleNamespace(alpha=torch.ones(1, 1, 1))
+    def render(current, cameras):
+        assert not torch.is_grad_enabled()
+        assert not current.verts_padded().requires_grad
+        calls.extend(cameras)
+        return torch.tensor(cameras, dtype=torch.float32).reshape(-1, 1, 1, 1) / 4
+    result = evaluate_geometry_validation(mesh, offsets, Dataset(),
+        SimpleNamespace(cameras=lambda batch: batch), SimpleNamespace(render_mask=render),
+        [1, 2, 3], 2, torch.device('cpu'), 1.)
+    assert calls == [1, 2, 3]
+    assert result['validation_silhouette'] == pytest.approx((.75**2 + .5**2 + .25**2) / 3)
+    assert result['validation_iou'] == pytest.approx(.5)
+    assert result['mean_vertex_displacement'] == 0
+    assert torch.equal(offsets, before) and torch.equal(offsets.grad, gradient)
+
+
+@pytest.mark.parametrize('patience,expected_epochs', [(1, 2), (0, 3)])
+def test_training_restores_best_validation_offsets(monkeypatch, tmp_path, patience, expected_epochs) -> None:
+    from dataclasses import replace
+    import csv
+    import src.optimizer as module
+    from src.mesh_io import mesh_from_arrays, _normalize_mesh, load_initial_mesh, restore_vertices
+    vertices = torch.tensor([[-1., -1., -1.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]])
+    mesh = mesh_from_arrays(vertices, torch.tensor([[0, 1, 2], [0, 2, 3], [0, 3, 1], [1, 3, 2]]), torch.device('cpu'))
+    mesh, transform = _normalize_mesh(mesh, True, True)
+    class Dataset:
+        frames = [SimpleNamespace() for _ in range(2)]
+        canvas_size = (4, 3)
+        def __len__(self):
+            return 2
+        def __getitem__(self, index):
+            return SimpleNamespace(alpha=torch.ones(4, 3), image=torch.ones(4, 3))
+        def representative_indices(self):
+            return []
+    evaluated = []
+    qualities = [.1, .2, .3]
+    evaluate = module.evaluate_geometry_validation
+    def validation(*args):
+        result = evaluate(*args)
+        evaluated.append(args[1].detach().clone())
+        # Controlled held-out deterioration, regardless of training improvement.
+        result.update(validation_silhouette=qualities[len(evaluated) - 1], validation_iou=.5)
+        return result
+    monkeypatch.setattr(module, 'evaluate_geometry_validation', validation)
+    monkeypatch.setattr(module, 'plot_losses', lambda *args: None)
+    monkeypatch.setenv('OUTPUT_DIR', str(tmp_path))
+    cfg = replace(load_config(tmp_path / 'missing.env'), num_epochs=3, geometry_views_per_epoch=0,
+                  geometry_view_batch_size=1, opt_lr_verts=.001, loss_rgb_weight=0.,
+                  early_stopping_patience=patience, export_every_epochs=1)
+    result = module.train_geometry(mesh, transform, Dataset(),
+        SimpleNamespace(freeze=lambda: None, cameras=lambda batch: batch),
+        SimpleNamespace(render_mask=lambda current, cameras: current.verts_padded().sigmoid()),
+        cfg, torch.device('cpu'), tmp_path)
+    assert len(evaluated) == expected_epochs
+    assert not torch.equal(evaluated[0], evaluated[-1])
+    expected = mesh.verts_padded() + evaluated[0]
+    assert torch.equal(result.mesh.verts_padded(), expected)
+    def check_exports(result, expected):
+        expected_triangles = restore_vertices(expected[0], transform)[mesh.faces_packed()]
+        for path in (result.final_obj, result.final_stl):
+            loaded, _ = load_initial_mesh(path, torch.device('cpu'), False, False)
+            triangles = loaded.verts_packed()[loaded.faces_packed()]
+            assert torch.allclose(triangles, expected_triangles, atol=1e-5)
+        assert not result.mesh.verts_padded().requires_grad
+
+    check_exports(result, expected)
+    rows = list(csv.DictReader((tmp_path / 'reconstruction/losses.csv').open()))
+    assert [int(row['is_best']) for row in rows] == [1] + [0] * (expected_epochs - 1)
+    assert all(int(row['best_epoch']) == 1 for row in rows)
+
+    # A longer run must preserve the exact files unless a later state wins.
+    original_files = [path.read_bytes() for path in (result.final_obj, result.final_stl)]
+    for later_wins in (False, True):
+        evaluated.clear()
+        qualities[:] = [.1, .2, .3, .05 if later_wins else .4]
+        longer = module.train_geometry(mesh, transform, Dataset(),
+            SimpleNamespace(freeze=lambda: None, cameras=lambda batch: batch),
+            SimpleNamespace(render_mask=lambda current, cameras: current.verts_padded().sigmoid()),
+            replace(cfg, num_epochs=4, early_stopping_patience=0), torch.device('cpu'),
+            tmp_path / ('later_best' if later_wins else 'longer'))
+        selected = evaluated[-1] if later_wins else evaluated[0]
+        with (longer.final_obj.parent / 'losses.csv').open() as handle:
+            longer_rows = list(csv.DictReader(handle))
+        assert [int(row['is_best']) for row in longer_rows] == [1, 0, 0, int(later_wins)]
+        assert [int(row['best_epoch']) for row in longer_rows] == [1, 1, 1, 4 if later_wins else 1]
+        check_exports(longer, mesh.verts_padded() + selected)
+        files = [path.read_bytes() for path in (longer.final_obj, longer.final_stl)]
+        if later_wins:
+            assert all(a != b for a, b in zip(files, original_files))
+        else:
+            assert files == original_files
+
+
+@pytest.mark.parametrize('epochs', [1, 3])
+@pytest.mark.parametrize('expanded', [False, True])
+def test_plot_losses_schema_compatibility(tmp_path, monkeypatch, epochs, expanded) -> None:
+    from src import visualization
+    csv_path = tmp_path / 'losses.csv'
+    for epoch in range(1, epochs + 1):
+        row = dict(epoch=epoch, total=.2, silhouette=.1, iou=.6, rgb=.01, normal=.02)
+        if expanded:
+            row.update(training_objective=.2, training_silhouette=.1, training_iou=.6,
+                       validation_silhouette=.15, validation_iou=.5, anchor=0., local_smoothness=0.,
+                       mean_vertex_displacement=0., median_vertex_displacement=0.,
+                       p95_vertex_displacement=0., max_vertex_displacement=0.,
+                       max_vertex_displacement_ratio=0., best_epoch=1, is_best=int(epoch == 1))
+        visualization.append_csv(csv_path, row)
+    labels = []
+    plot = visualization.plt.plot
+    def record_plot(*args, **kwargs):
+        labels.append(kwargs['label'])
+        return plot(*args, **kwargs)
+    monkeypatch.setattr(visualization.plt, 'plot', record_plot)
+    output = tmp_path / 'plots' / 'losses.png'
+    visualization.plot_losses(csv_path, output)
+    assert output.is_file()
+    with Image.open(output) as image:
+        image.verify()
+    assert {'rgb', 'normal'} <= set(labels)
+    assert not {'epoch', 'best_epoch', 'is_best'} & set(labels)
+    if expanded:
+        assert {'training_objective', 'training_silhouette', 'training_iou',
+                'validation_silhouette', 'validation_iou', 'anchor', 'local_smoothness'} <= set(labels)
+        assert not {'total', 'silhouette', 'iou'} & set(labels)
+    else:
+        assert {'total', 'silhouette', 'iou'} <= set(labels)

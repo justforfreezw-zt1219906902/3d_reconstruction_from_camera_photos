@@ -58,9 +58,14 @@ def plot_losses(csv_path: Path, out_path: Path) -> None:
     if data.size == 0:
         return
     plt.figure(figsize=(9, 5))
-    for name in data.dtype.names:
-        if name != "epoch":
-            plt.plot(data["epoch"], data[name], label=name)
+    names = data.dtype.names or ()
+    aliases = {"total": "training_objective", "silhouette": "training_silhouette", "iou": "training_iou"}
+    for name in names:
+        if name in {"epoch", "best_epoch", "is_best"}:
+            continue
+        if aliases.get(name) in names:
+            continue
+        plt.plot(data["epoch"], data[name], label=name)
     plt.yscale("log")
     plt.xlabel("epoch")
     plt.ylabel("value")
