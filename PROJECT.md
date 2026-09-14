@@ -1,119 +1,192 @@
 # 3D Reconstruction From Camera Photos
 
-## Purpose
+## Branch Purpose
 
-Reconstruct the real geometry of a photographed physical object from calibrated
-multi-view RGBA images, using the CAD/STL model as a design prior.
+This branch evaluates image-driven 3D reconstruction from a generic initial
+shape.
 
-The CAD model is not ground-truth geometry for the manufactured object.
+The experiment intentionally starts from a sphere that does not resemble the
+target object.
+
+The purpose is to measure how much target geometry can be recovered from
+multi-view images rather than inherited from a CAD design prior.
+
+This branch is therefore different from the CAD-prior refinement workflow.
+
+## Core Experimental Question
+
+Given:
+
+- calibrated or independently established camera / pose information
+- multi-view RGBA observations
+- a generic sphere occupying approximately the correct spatial region
+
+can the system reconstruct a 3D mesh that is measurably closer to the real
+object than the initial sphere?
 
 ## Inputs
 
+Primary reconstruction inputs:
+
 - Multi-view RGBA photographs
 - `positions.csv`
-- CAD/STL design prior
+- generic initial sphere / spatial initialization
+- independent camera calibration where required
 
-Current dataset contains approximately 336 views distributed across multiple
-camera elevation rings.
+Current sphere:
+
+    /Users/zhaowei/Downloads/openscan-benchy-model_files/initial_sphere_demo_scale.stl
+
+Optional benchmark-only input:
+
+- ground-truth STL
+
+Ground truth is evaluation-only and must never participate in reconstruction.
+
+## Initial Sphere Semantics
+
+The sphere is not:
+
+- a CAD prior
+- ground truth
+- a geometry anchor
+- a shape-preservation target
+
+The sphere may provide only:
+
+- approximate spatial center
+- approximate scale / extent
+- initial bounding volume
+- numerical initialization
+
+The reconstruction must be free to become substantially non-spherical.
+
+## Desired Architecture
+
+The intended experimental flow is:
+
+Camera / Pose
+    ↓
+Multi-view Image Observations
+    ↓
+Image-Derived Coarse Geometry
+    ↓
+Topology / Surface Generation
+    ↓
+Geometry Refinement
+    ↓
+Final Mesh
+    ↓
+Separate Ground-Truth Evaluation
+
+The reconstruction should not rely exclusively on fixed-topology vertex
+offsets from the sphere.
+
+## Camera Ownership
+
+Camera and pose parameters must represent the acquisition system.
+
+Geometry mismatch between the sphere and the photographed object must not be
+silently absorbed into:
+
+- camera FOV
+- camera distance
+- principal-point offsets
+- pose convention
+- per-frame pose corrections
+
+Camera calibration should therefore be independent of target-shaped geometry
+for this branch.
+
+## Geometry Ownership
+
+### Image-derived coarse geometry
+
+Owns the large shape change from generic spatial initialization toward the
+observed object.
+
+It may change:
+
+- vertex count
+- face count
+- topology
+- surface placement
+
+### Geometry refinement
+
+Owns residual corrections after an image-derived coarse geometry exists.
+
+It should improve agreement with the observations without reintroducing
+catastrophic mesh artifacts.
+
+The original sphere is not the refinement reference.
+
+## Ground Truth
+
+The known target mesh is withheld from reconstruction.
+
+It may only be used after reconstruction for quantitative benchmark metrics.
+
+Primary benchmark comparison:
+
+    initial sphere -> ground truth
+
+versus:
+
+    final reconstruction -> ground truth
+
+A successful image-driven reconstruction should reduce 3D error by a
+meaningful margin.
 
 ## Outputs
 
-Preserve the existing output contract, including:
+Preserve the existing output contract where practical, including:
 
 - `final.obj`
 - `final.stl`
 - existing output directory conventions
 
-## Current pipeline
+Also preserve enough intermediate artifacts to evaluate:
 
-The repository currently contains stages for:
+- initial sphere
+- image-derived coarse geometry
+- final geometry
 
-1. Input/data validation
-2. Camera fitting and pose handling
-3. Pose convention selection
-4. CAD proxy preparation / normalization
-5. Geometry optimization
-6. Mesh export
-
-## Parameter ownership
-
-The intended architecture separates three classes of parameters.
-
-### Camera / pose
-
-Owns:
-
-- camera projection
-- camera extrinsics / pose
-- camera-related calibration parameters
-
-Camera error should not silently be compensated for by geometry deformation.
-
-### Global CAD-to-real alignment
-
-Owns global similarity alignment between the CAD design prior and the
-observed manufactured object:
-
-- rotation
-- translation
-- scale
-
-This layer must be explicit.
-
-### Local geometry deformation
-
-Owns only residual/local shape differences after camera and global alignment
-have been accounted for.
-
-Per-vertex offsets must not become the implicit owner of unresolved global
-rotation, translation, or scale.
-
-## Architectural direction
-
-The desired flow is:
-
-Camera / Pose
-    ↓
-Global CAD-to-real Similarity Alignment
-    ↓
-Coarse / Fine / Local Geometry Deformation
-    ↓
-Final Mesh
-
-Avoid designs where the optimizer immediately exposes unrestricted per-vertex
-offsets before global alignment has been resolved.
-
-## Compatibility requirements
+## Compatibility
 
 Preserve:
 
 - `main.py` as the primary CLI entry point
-- `positions.csv` format
+- `positions.csv`
 - RGBA image inputs
-- CAD/STL inputs
 - output directory conventions
 - `final.obj`
 - `final.stl`
 
-Existing CLI behavior must remain compatible, including:
+Existing CLI behavior should remain compatible where its semantics remain
+valid:
 
 - `--validate-only`
 - `--camera-fit-only`
 - `--skip-camera-fit`
 
-Do not rewrite the CLI architecture unless a concrete requirement demands it.
+Do not preserve a historical behavior when doing so would violate the
+image-only experiment, especially camera fitting against sphere shape or
+CAD-reference anchoring.
 
-## Engineering principles
+## Engineering Principles
 
-- Treat Git as the source of code truth.
-- Preserve existing user changes unless explicitly asked to replace them.
-- Prefer explicit ownership of optimization parameters.
-- Add regression tests when changing parameter ownership or pipeline stages.
-- Validate architecture changes against both synthetic cases and existing
-  pipeline behavior where practical.
-- Keep changes incremental enough to isolate regressions.
+- Git is the source of code truth.
+- Ground truth must be isolated from reconstruction code.
+- Camera error and geometry error must have explicit ownership.
+- Do not use the generic sphere as hidden shape supervision.
+- Prefer image-derived geometry before local mesh refinement.
+- Maintain deterministic benchmark outputs.
+- Add regression tests when architectural ownership changes.
+- Evaluate both held-out 2D views and withheld 3D ground truth.
+- Keep CAD-prior behavior isolated if retained as a separate mode.
 
-## Runtime architecture
+## Runtime Architecture
 
 Forge-Orchestrator is the task and multi-agent runtime.
 
