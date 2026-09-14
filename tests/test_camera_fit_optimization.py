@@ -4,9 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from PIL import Image
 
-from src.camera_fitting import _load_camera_fit_data, select_representative_indices
+from src.camera_fitting import CameraFitGateError, _load_camera_fit_data, fit_camera, select_representative_indices
 from src.fast_silhouette import CameraParameters, FastMesh, FastSilhouetteRenderer, silhouette_iou
 from src.pose_conventions import CameraConvention, candidate_conventions
 from src.validation import validate_inputs
@@ -92,3 +93,76 @@ def test_camera_fit_has_no_pytorch3d_rasterizer_dependency() -> None:
     source = Path("src/camera_fitting.py").read_text()
     assert "MeshRasterizer" not in source
     assert "SoftSilhouetteShader" not in source
+
+
+def _independent_contract() -> SimpleNamespace:
+    frames = tuple(
+        SimpleNamespace(
+            image=f"frame_{index}.png", position_index=index,
+            theta_deg=theta, phi_deg=0.0,
+        )
+        for index, theta in enumerate((0.0, 180.0))
+    )
+    return SimpleNamespace(frames=frames)
+
+
+def test_image_only_camera_uses_rig_metadata_without_mesh_or_silhouette_rendering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.camera_fitting as camera_fitting
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("image_only camera calibration must not inspect mesh or silhouettes")
+
+    monkeypatch.setattr(camera_fitting, "load_fast_mesh", forbidden)
+    monkeypatch.setattr(camera_fitting, "FastSilhouetteRenderer", forbidden)
+    cfg = SimpleNamespace(
+        reconstruction_mode="image_only",
+        camera_calibration_source="positions_rig",
+        camera_distance_initial=3.25,
+        camera_fov_initial=54.0,
+    )
+    result = fit_camera(tmp_path / "not-needed-sphere.stl", _independent_contract(), cfg, tmp_path / "camera")
+
+    assert result.frozen is True
+    assert result.camera.distance == 3.25
+    assert result.camera.fov_deg == 54.0
+    assert result.theta_deltas == [0.0, 0.0]
+    assert result.phi_deltas == [0.0, 0.0]
+    assert result.metrics["shape_based_camera_fit"] is False
+    assert result.metrics["calibration_frozen"] is True
+    assert (tmp_path / "camera" / "frame_poses.csv").exists()
+
+
+def test_image_only_camera_rejects_missing_independent_calibration(tmp_path: Path) -> None:
+    cfg = SimpleNamespace(
+        reconstruction_mode="image_only",
+        camera_calibration_source="calibration_file",
+        camera_calibration_path=None,
+        camera_distance_initial=2.7,
+        camera_fov_initial=60.0,
+    )
+    with pytest.raises(CameraFitGateError, match="CAMERA_CALIBRATION_PATH"):
+        fit_camera(tmp_path / "sphere.stl", _independent_contract(), cfg, tmp_path / "camera")
+
+
+def test_image_only_camera_accepts_independently_measured_calibration_file(tmp_path: Path) -> None:
+    calibration_path = tmp_path / "rig.json"
+    calibration_path.write_text(
+        '{"camera": {"distance": 4.0, "fov_deg": 48.0, '
+        '"principal_point_x_ndc": 0.1}}'
+    )
+    cfg = SimpleNamespace(
+        reconstruction_mode="image_only",
+        camera_calibration_source="calibration_file",
+        camera_calibration_path=calibration_path,
+        camera_distance_initial=2.7,
+        camera_fov_initial=60.0,
+    )
+    result = fit_camera(tmp_path / "sphere.stl", _independent_contract(), cfg, tmp_path / "camera")
+
+    assert result.camera.as_dict() == {
+        "distance": 4.0, "fov_deg": 48.0,
+        "principal_point_x_ndc": 0.1, "principal_point_y_ndc": 0.0,
+    }
+    assert result.metrics["camera_source"] == "calibration_file"

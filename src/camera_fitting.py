@@ -22,7 +22,7 @@ from .fast_silhouette import (
     silhouette_iou,
     silhouette_summary,
 )
-from .pose_conventions import CameraConvention, candidate_conventions
+from .pose_conventions import CameraConvention, DEFAULT_CONVENTION, candidate_conventions
 from .rgba_dataset import build_layouts, load_alpha_with_layout, load_rgb_with_layout
 from .validation import DatasetContract, FrameRecord
 
@@ -38,6 +38,10 @@ class FastCameraFitResult:
     theta_deltas: list[float]
     phi_deltas: list[float]
     metrics: dict
+    # The image-only result is calibration data, not an optimisation result.
+    # Pipeline code must transfer it to an OpenScanCameraModel and freeze it
+    # before any geometry stage begins.
+    frozen: bool = False
 
 
 @dataclass
@@ -305,9 +309,137 @@ def _write_frame_poses(data: CameraFitData, theta_deltas: list[float], phi_delta
             })
 
 
+def _calibration_convention(value: object) -> CameraConvention:
+    """Decode an independently supplied convention without consulting imagery."""
+    if value is None:
+        return DEFAULT_CONVENTION
+    if not isinstance(value, dict):
+        raise CameraFitGateError("Independent calibration field 'convention' must be an object.")
+    required = {"theta_axis", "phi_axis", "theta_sign", "phi_sign", "rotation_order"}
+    missing = required - set(value)
+    if missing:
+        raise CameraFitGateError(
+            "Independent calibration convention is incomplete; missing "
+            + ", ".join(sorted(missing)) + "."
+        )
+    try:
+        convention = CameraConvention(**{key: value[key] for key in required})
+    except (TypeError, ValueError) as exc:
+        raise CameraFitGateError("Independent calibration contains an invalid pose convention.") from exc
+    if convention not in candidate_conventions():
+        raise CameraFitGateError("Independent calibration contains an unsupported pose convention.")
+    return convention
+
+
+def _independent_camera_from_file(path: Path) -> tuple[CameraParameters, CameraConvention]:
+    if not path.exists() or not path.is_file():
+        raise CameraFitGateError(f"Independent calibration file is unavailable: {path}")
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CameraFitGateError(f"Independent calibration file is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise CameraFitGateError("Independent calibration file must contain a JSON object.")
+    values = payload.get("camera", payload)
+    if not isinstance(values, dict):
+        raise CameraFitGateError("Independent calibration field 'camera' must be an object.")
+    required = {"distance", "fov_deg"}
+    missing = required - set(values)
+    if missing:
+        raise CameraFitGateError(
+            "Independent calibration is incomplete; required camera fields: distance, fov_deg. "
+            "Missing " + ", ".join(sorted(missing)) + "."
+        )
+    try:
+        camera = CameraParameters(
+            distance=float(values["distance"]),
+            fov_deg=float(values["fov_deg"]),
+            x_offset=float(values.get("principal_point_x_ndc", values.get("x_offset", 0.0))),
+            y_offset=float(values.get("principal_point_y_ndc", values.get("y_offset", 0.0))),
+        )
+    except (TypeError, ValueError) as exc:
+        raise CameraFitGateError("Independent calibration camera values must be numeric.") from exc
+    convention = _calibration_convention(payload.get("convention"))
+    return camera, convention
+
+
+def _validate_independent_camera(camera: CameraParameters, contract: DatasetContract) -> None:
+    values = (camera.distance, camera.fov_deg, camera.x_offset, camera.y_offset)
+    if not all(math.isfinite(value) for value in values):
+        raise CameraFitGateError("Independent calibration contains non-finite camera values.")
+    if not 0.5 <= camera.distance <= 10.0 or not 15.0 <= camera.fov_deg <= 120.0:
+        raise CameraFitGateError(
+            "Independent calibration distance/FOV is outside supported bounds "
+            "(distance 0.5..10, fov_deg 15..120)."
+        )
+    if abs(camera.x_offset) > 1.0 or abs(camera.y_offset) > 1.0:
+        raise CameraFitGateError("Independent calibration principal-point offsets must be in [-1, 1].")
+    poses = {(round(frame.theta_deg % 360.0, 6), round(frame.phi_deg, 6)) for frame in contract.frames}
+    if len(poses) < 2:
+        raise CameraFitGateError(
+            "Independent image-only calibration requires at least two distinct acquisition poses in positions.csv."
+        )
+
+
+def _fit_image_only_camera(contract: DatasetContract, cfg: Config, output_dir: Path) -> FastCameraFitResult:
+    """Build a frozen calibration from rig metadata, never mesh/image agreement.
+
+    ``positions_rig`` treats the commanded angles in ``positions.csv`` and
+    CAMERA_DISTANCE_INITIAL/CAMERA_FOV_INITIAL as known acquisition-rig
+    metadata.  ``calibration_file`` accepts an independently measured JSON
+    camera record.  Neither route loads the initial mesh, alpha masks, or a
+    renderer, so object shape cannot leak into camera parameters.
+    """
+    source = getattr(cfg, "camera_calibration_source", "positions_rig")
+    if source == "positions_rig":
+        camera = CameraParameters(cfg.camera_distance_initial, cfg.camera_fov_initial, 0.0, 0.0)
+        convention = DEFAULT_CONVENTION
+    elif source == "calibration_file":
+        path = getattr(cfg, "camera_calibration_path", None)
+        if path is None:
+            raise CameraFitGateError(
+                "CAMERA_CALIBRATION_PATH is required for image_only mode when "
+                "CAMERA_CALIBRATION_SOURCE=calibration_file."
+            )
+        camera, convention = _independent_camera_from_file(Path(path))
+    else:
+        raise CameraFitGateError(
+            "image_only mode requires CAMERA_CALIBRATION_SOURCE=positions_rig or calibration_file."
+        )
+    _validate_independent_camera(camera, contract)
+    theta_deltas = [0.0] * len(contract.frames)
+    phi_deltas = [0.0] * len(contract.frames)
+    data = CameraFitData(contract.frames, (), (), 0)
+    _write_frame_poses(data, theta_deltas, phi_deltas, output_dir / "frame_poses.csv")
+    (output_dir / "global_camera_parameters.json").write_text(json.dumps(camera.as_dict(), indent=2))
+    metrics = {
+        "camera_source": source,
+        "calibration_frozen": True,
+        "pose_deltas_frozen": True,
+        "selected_convention": convention.as_dict(),
+        "evaluated_frames": len(contract.frames),
+        "shape_based_camera_fit": False,
+    }
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    return FastCameraFitResult(camera, convention, theta_deltas, phi_deltas, metrics, frozen=True)
+
+
 def fit_camera(mesh_path: Path, contract: DatasetContract, cfg: Config, output_dir: Path) -> FastCameraFitResult:
     started = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(cfg, "reconstruction_mode", "cad_prior") == "image_only":
+        # This branch intentionally occurs before loading mesh pixels or alpha
+        # masks.  It is the image-only camera/geometry ownership boundary.
+        result = _fit_image_only_camera(contract, cfg, output_dir)
+        profile = {
+            "total_frames": len(contract.frames),
+            "total_camera_fit_seconds": time.perf_counter() - started,
+            "silhouette_render_count": 0,
+            "calibration_source": result.metrics["camera_source"],
+            "calibration_frozen": True,
+        }
+        (output_dir / "profile.json").write_text(json.dumps(profile, indent=2))
+        return result
     data, preload_seconds = _load_camera_fit_data(contract, cfg.camera_fit_max_dimension)
     selected = select_representative_indices(data, cfg.camera_fit_max_frames)
     _save_selected_frames(data, selected, output_dir / "selected_frames.csv")

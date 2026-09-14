@@ -1,5 +1,6 @@
 """Regression tests for held-out gradients and selected-state mesh exports."""
 import csv
+import inspect
 import math
 from dataclasses import replace
 from types import SimpleNamespace
@@ -10,6 +11,13 @@ import torch
 import src.optimizer as optimizer
 from src.config import load_config
 from src.mesh_io import _normalize_mesh, load_initial_mesh, mesh_from_arrays, restore_vertices
+
+
+def test_best_state_module_has_no_ground_truth_dependency():
+    """Selection must remain isolated from post-reconstruction evaluation."""
+    source = inspect.getsource(optimizer).lower()
+    assert "ground_truth" not in source
+    assert "ground-truth" not in source
 
 
 def _reference_mesh():
@@ -136,7 +144,12 @@ def test_selected_offsets_drive_real_exports(monkeypatch, tmp_path, qualities, a
             'validation_silhouette', 'validation_iou', 'anchor', 'local_smoothness',
             'mean_vertex_displacement', 'median_vertex_displacement',
             'p95_vertex_displacement', 'max_vertex_displacement',
-            'max_vertex_displacement_ratio', 'best_epoch', 'is_best',
+            'max_vertex_displacement_ratio',
+            'validity_is_valid', 'validity_non_finite_vertex_count',
+            'validity_degenerate_face_count', 'validity_self_intersection_pair_count',
+            'validity_spike_vertex_count', 'validity_extreme_edge_count',
+            'validity_disconnected_fragment_count', 'validity_small_component_count',
+            'best_epoch', 'is_best',
         }
         assert required <= set(reader.fieldnames)
         rows = list(reader)

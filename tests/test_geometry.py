@@ -132,6 +132,48 @@ def test_regularization_is_outside_view_loop() -> None:
     assert "for step, batch in enumerate" in source
 
 
+def test_image_only_training_uses_coarse_topology_without_cad_offset_controls(monkeypatch, tmp_path) -> None:
+    """Image-only refinement must never enter the CAD regularizer/bound path."""
+    from dataclasses import replace
+    import src.optimizer as module
+    from src.mesh_io import _normalize_mesh, mesh_from_arrays
+
+    # Five vertices/six faces: arbitrary coarse topology, not a sphere proxy.
+    mesh, transform = _normalize_mesh(mesh_from_arrays(
+        torch.tensor([[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [.5, .5, 1.5]]),
+        torch.tensor([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 4], [1, 4, 3], [2, 3, 4]]),
+        torch.device("cpu"),
+    ), True, True)
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
+    cfg = replace(load_config(tmp_path / "missing.env"), reconstruction_mode="image_only",
+                  num_epochs=1, geometry_views_per_epoch=0, geometry_view_batch_size=1,
+                  loss_rgb_weight=0., loss_normal_weight=0., loss_laplacian_weight=0.,
+                  loss_edge_weight=0., image_only_coarse_anchor_weight=0.,
+                  max_local_deformation_ratio=.03, max_vertex_displacement_ratio=.03,
+                  export_every_epochs=1, save_preview_every_epochs=1)
+
+    class Dataset:
+        frames = [SimpleNamespace(phi_deg=0., theta_deg=0.), SimpleNamespace(phi_deg=0., theta_deg=180.)]
+        canvas_size = (4, 3)
+        def __len__(self): return 2
+        def __getitem__(self, index): return SimpleNamespace(alpha=torch.zeros(5, 3), image=torch.zeros(5, 3))
+        def representative_indices(self): return []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("CAD local-deformation path must not run in image_only mode")
+    monkeypatch.setattr(module, "regularization_losses", forbidden)
+    monkeypatch.setattr(module, "_bounded_local_offsets", forbidden)
+    monkeypatch.setattr(module, "plot_losses", lambda *args: None)
+    result = module.train_geometry(
+        mesh, transform, Dataset(),
+        SimpleNamespace(freeze=lambda: None, cameras=lambda batch: batch),
+        SimpleNamespace(render_mask=lambda current, cameras: current.verts_padded().sigmoid().expand(len(cameras), -1, -1)),
+        cfg, torch.device("cpu"), tmp_path,
+    )
+    assert torch.equal(result.mesh.faces_packed(), mesh.faces_packed())
+    assert result.mesh.verts_packed().shape == mesh.verts_packed().shape
+
+
 def test_local_offsets_exclude_global_similarity_modes() -> None:
     from src.optimizer import _local_offset_basis, _project_local_offsets
     vertices = torch.tensor([[[-1., -1., -1.], [1., 0., 0.], [0., 2., 0.], [0., 0., 3.]]], dtype=torch.float64)
@@ -252,6 +294,24 @@ def test_reference_deformation_config_defaults(monkeypatch: pytest.MonkeyPatch, 
         "loss_local_smoothness_weight": 0.1,
         "max_local_deformation_ratio": 0.03,
         "geometry_validation_fraction": 0.20,
+        "reconstruction_mode": "cad_prior",
+        "ground_truth_mesh_path": None,
+        "camera_calibration_source": "positions_rig",
+        "camera_calibration_path": None,
+        "coarse_volume_center": None,
+        "coarse_volume_scale": None,
+        "coarse_volume_padding_ratio": 0.25,
+        "coarse_voxel_resolution": 128,
+        "coarse_min_silhouette_support": 1.0,
+        "coarse_occupancy_threshold": 0.5,
+        "coarse_min_component_voxels": 64,
+        "coarse_marching_cubes_step": 1,
+        "mesh_cleanup_enabled": True,
+        "mesh_min_component_faces": 32,
+        "mesh_max_edge_length_ratio": 10.0,
+        "mesh_spike_ratio": 8.0,
+        "image_only_refinement_enabled": True,
+        "image_only_coarse_anchor_weight": 0.0,
     }
     for key, value in expected.items():
         assert getattr(cfg, key) == value
@@ -273,6 +333,90 @@ def test_reference_deformation_config_defaults(monkeypatch: pytest.MonkeyPatch, 
     }
     for key, value in unchanged.items():
         assert getattr(cfg, key) == value
+
+
+def test_image_only_config_isolated_snapshot_and_cad_controls_are_inert(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(os, "environ", {})
+    calibration = tmp_path / "independent_calibration.json"
+    ground_truth = tmp_path / "evaluation_only.stl"
+    env_file = tmp_path / "image_only.env"
+    env_file.write_text(
+        "\n".join((
+            f"OUTPUT_DIR={tmp_path / 'outputs'}",
+            "RECONSTRUCTION_MODE=image_only",
+            f"GROUND_TRUTH_MESH_PATH={ground_truth}",
+            "CAMERA_CALIBRATION_SOURCE=calibration_file",
+            f"CAMERA_CALIBRATION_PATH={calibration}",
+            "COARSE_VOLUME_CENTER=1.5, -2, 0.25",
+            "COARSE_VOLUME_SCALE=4.0",
+            "COARSE_VOLUME_PADDING_RATIO=0.5",
+            "COARSE_VOXEL_RESOLUTION=64",
+            "COARSE_MIN_SILHOUETTE_SUPPORT=0.75",
+            "COARSE_OCCUPANCY_THRESHOLD=0.6",
+            "COARSE_MIN_COMPONENT_VOXELS=12",
+            "COARSE_MARCHING_CUBES_STEP=2",
+            "MESH_CLEANUP_ENABLED=false",
+            "MESH_MIN_COMPONENT_FACES=9",
+            "MESH_MAX_EDGE_LENGTH_RATIO=12.0",
+            "MESH_SPIKE_RATIO=6.0",
+            "IMAGE_ONLY_REFINEMENT_ENABLED=false",
+            "IMAGE_ONLY_COARSE_ANCHOR_WEIGHT=0.2",
+            # These CAD-prior-only values must not become image-only controls.
+            "LOSS_ANCHOR_WEIGHT=3.0",
+            "MAX_LOCAL_DEFORMATION_RATIO=0.02",
+        ))
+    )
+    cfg = load_config(env_file)
+    assert cfg.reconstruction_mode == "image_only"
+    assert cfg.ground_truth_mesh_path == ground_truth
+    assert cfg.camera_calibration_source == "calibration_file"
+    assert cfg.camera_calibration_path == calibration
+    assert cfg.coarse_volume_center == (1.5, -2.0, 0.25)
+    assert cfg.coarse_volume_scale == 4.0
+    assert cfg.coarse_volume_padding_ratio == 0.5
+    assert cfg.coarse_voxel_resolution == 64
+    assert cfg.coarse_min_silhouette_support == 0.75
+    assert cfg.coarse_occupancy_threshold == 0.6
+    assert cfg.coarse_min_component_voxels == 12
+    assert cfg.coarse_marching_cubes_step == 2
+    assert not cfg.mesh_cleanup_enabled
+    assert cfg.mesh_min_component_faces == 9
+    assert cfg.mesh_max_edge_length_ratio == 12.0
+    assert cfg.mesh_spike_ratio == 6.0
+    assert not cfg.image_only_refinement_enabled
+    assert cfg.image_only_coarse_anchor_weight == 0.2
+    assert cfg.loss_anchor_weight == 0.0
+    assert cfg.max_local_deformation_ratio == 0.0
+    from src.config import save_config_snapshot
+
+    snapshot_path = tmp_path / "run_config.json"
+    save_config_snapshot(cfg, snapshot_path)
+    snapshot = cfg.as_dict()
+    assert snapshot["ground_truth_mesh_path"] == str(ground_truth)
+    assert snapshot["camera_calibration_path"] == str(calibration)
+    assert snapshot["coarse_volume_center"] == (1.5, -2.0, 0.25)
+    assert snapshot_path.exists()
+    assert ground_truth.as_posix() in snapshot_path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        ("RECONSTRUCTION_MODE", "unknown", "RECONSTRUCTION_MODE"),
+        ("CAMERA_CALIBRATION_SOURCE", "sphere_fit", "CAMERA_CALIBRATION_SOURCE"),
+        ("COARSE_VOXEL_RESOLUTION", "15", "COARSE_VOXEL_RESOLUTION"),
+        ("COARSE_MIN_SILHOUETTE_SUPPORT", "0", "COARSE_MIN_SILHOUETTE_SUPPORT"),
+    ],
+)
+def test_image_only_config_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, value: str, message: str,
+) -> None:
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=message):
+        load_config(tmp_path / "missing.env")
 
 
 def test_reference_deformation_config_env_overrides(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -518,6 +662,31 @@ def test_best_geometry_comparison() -> None:
         candidate = {**best, **changes}
         assert better(candidate, best, constraints_satisfied=True) == expected
         assert not better(candidate, best, constraints_satisfied=False)
+
+
+def test_best_geometry_comparison_prefers_validity_when_holdout_quality_is_tied() -> None:
+    from src.optimizer import is_better_geometry_state as better
+
+    best = dict(
+        validation_silhouette=.2, validation_iou=.6,
+        mean_vertex_displacement=.02, p95_vertex_displacement=.03,
+        validity_is_valid=0., validity_non_finite_vertex_count=0.,
+        validity_degenerate_face_count=2., validity_self_intersection_pair_count=1.,
+        validity_spike_vertex_count=3., validity_extreme_edge_count=4.,
+        validity_disconnected_fragment_count=1., validity_small_component_count=2.,
+    )
+    # A valid mesh outranks an invalid one even if it moved farther from its
+    # refinement base; selection must not use CAD proximity as the tie-break.
+    cleaner = {**best, "validity_is_valid": 1., "mean_vertex_displacement": .5,
+               "p95_vertex_displacement": .6}
+    assert better(cleaner, best, constraints_satisfied=True)
+    # When both are invalid, the defect counts provide a deterministic order.
+    fewer_intersections = {**best, "validity_self_intersection_pair_count": 0.}
+    assert better(fewer_intersections, best, constraints_satisfied=True)
+    worse_degeneracy = {**best, "validity_degenerate_face_count": 3.}
+    assert not better(worse_degeneracy, best, constraints_satisfied=True)
+    assert not better({**best, "validity_spike_vertex_count": float("nan")}, None,
+                      constraints_satisfied=True)
 
 
 def test_validation_no_grad_and_view_weighting() -> None:

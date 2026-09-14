@@ -23,6 +23,18 @@ class MeshTransform:
     normalized_object_size: float
 
 
+def inspect_mesh_validity(mesh: Meshes, **kwargs):
+    """Return topology-agnostic mesh diagnostics for export/pipeline callers.
+
+    The local import keeps mesh I/O independent at import time while exposing a
+    single convenient entry point for PyTorch3D meshes.  The report compares no
+    vertices to a CAD or sphere reference.
+    """
+    from .mesh_validity import inspect_mesh_validity as _inspect_mesh_validity
+
+    return _inspect_mesh_validity(mesh, **kwargs)
+
+
 def _deduplicate_triangles(vertices: list[tuple[float, float, float]]) -> tuple[torch.Tensor, torch.Tensor]:
     index_by_vertex: dict[tuple[float, float, float], int] = {}
     unique: list[tuple[float, float, float]] = []

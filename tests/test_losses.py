@@ -10,6 +10,8 @@ from pytorch3d.loss import (
 from pytorch3d.structures import Meshes
 
 from src.losses import (
+    coarse_edge_regularization_loss,
+    image_only_regularization_losses,
     local_deformation_smoothness_loss,
     reference_anchor_loss,
     regularization_losses,
@@ -158,3 +160,29 @@ def test_audited_regularizers_reject_shrinkage_and_retain_normal_consistency() -
     assert identity['anchor'].item() == identity['local_smoothness'].item() == 0.
     assert deformed['anchor'].item() > identity['anchor'].item()
     assert deformed['local_smoothness'].item() > identity['local_smoothness'].item()
+
+
+def test_image_only_regularizers_reference_only_the_coarse_mesh_and_have_gradients() -> None:
+    # This topology deliberately does not resemble or require a sphere.
+    vertices = torch.tensor([
+        [0., 0., 0.], [2., 0., 0.], [0., 1., 0.], [0., 0., 1.5], [1., .5, 2.],
+    ])
+    faces = torch.tensor([[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 4], [1, 4, 3], [2, 3, 4]])
+    coarse = Meshes(verts=[vertices], faces=[faces])
+    current_vertices = (vertices + torch.tensor([[.1, 0., 0.], [0., 0., 0.], [0., .2, 0.], [0., 0., 0.], [0., 0., -.1]])).requires_grad_()
+    current = Meshes(verts=[current_vertices], faces=[faces])
+
+    terms = image_only_regularization_losses(current, coarse)
+    assert set(terms) == {"normal", "smoothness", "edge", "coarse_anchor"}
+    assert terms["smoothness"] > 0
+    assert terms["edge"] > 0
+    assert terms["coarse_anchor"] > 0
+    sum(terms.values()).backward()
+    assert torch.isfinite(current_vertices.grad).all()
+
+    identity = coarse_edge_regularization_loss(coarse, coarse)
+    assert identity.item() == pytest.approx(0., abs=1e-12)
+    other_faces = faces.clone()
+    other_faces[0] = other_faces[0].flip(0)
+    with pytest.raises(ValueError, match="topology"):
+        image_only_regularization_losses(current, Meshes(verts=[vertices], faces=[other_faces]))

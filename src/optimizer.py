@@ -15,8 +15,14 @@ from tqdm import tqdm
 
 from .config import Config
 from .export_utils import save_checkpoint
-from .losses import alpha_silhouette_loss, masked_rgb_loss, regularization_losses, soft_iou_per_image
-from .mesh_io import MeshTransform, export_mesh_obj, export_mesh_stl
+from .losses import (
+    alpha_silhouette_loss,
+    image_only_regularization_losses,
+    masked_rgb_loss,
+    regularization_losses,
+    soft_iou_per_image,
+)
+from .mesh_io import MeshTransform, export_mesh_obj, export_mesh_stl, inspect_mesh_validity
 from .openscan_pose import OpenScanCameraModel
 from .rgba_dataset import RGBADataset
 from .renderer import ReconstructionRenderer
@@ -97,10 +103,16 @@ def is_better_geometry_state(
 ) -> bool:
     """Compare valid states lexicographically; exact ties retain the incumbent.
 
-    Lower validation MSE wins, then higher IoU, using an absolute tolerance
-    for each quality metric. Effectively tied quality prefers lower mean,
-    then lower p95 displacement. Callers own the geometry constraint checks.
-    Nonfinite metrics are never eligible, including missing holdout quality.
+    Lower held-out validation MSE wins, then higher held-out IoU, using an
+    absolute tolerance for each quality metric. Effectively tied image
+    quality prefers the cleaner arbitrary-topology mesh before considering
+    displacement. Callers own hard geometry constraint checks. This helper
+    deliberately receives only reconstruction/validation diagnostics; external
+    post-reconstruction reference evaluation is outside its interface.
+
+    Older callers that do not yet collect validity diagnostics retain the
+    historical displacement tie-break by treating omitted counts as zero.
+    Training always supplies the complete set below.
     """
     if not math.isfinite(quality_tolerance) or quality_tolerance < 0:
         raise ValueError("quality_tolerance must be finite and non-negative")
@@ -108,11 +120,34 @@ def is_better_geometry_state(
             "mean_vertex_displacement", "p95_vertex_displacement")
     if not constraints_satisfied or not all(math.isfinite(candidate[k]) for k in keys):
         return False
+    # Counts come from inspect_mesh_validity, which compares the candidate
+    # only with itself. A fully-tested valid mesh wins first; then rank the
+    # most harmful defects before less severe cleanup indicators.
+    validity_keys = (
+        ("validity_is_valid", -1),
+        ("validity_non_finite_vertex_count", 1),
+        ("validity_degenerate_face_count", 1),
+        ("validity_self_intersection_pair_count", 1),
+        ("validity_spike_vertex_count", 1),
+        ("validity_extreme_edge_count", 1),
+        ("validity_disconnected_fragment_count", 1),
+        ("validity_small_component_count", 1),
+    )
+    if not all(math.isfinite(candidate.get(key, 0.0)) for key, _ in validity_keys):
+        return False
     if best is None:
         return True
     for key, direction in ((keys[0], 1), (keys[1], -1)):
         difference = direction * (candidate[key] - best[key])
         if abs(difference) > quality_tolerance:
+            return difference < 0
+    for key, direction in validity_keys:
+        candidate_value = candidate.get(key, 0.0)
+        best_value = best.get(key, 0.0)
+        if not math.isfinite(best_value):
+            return True
+        difference = direction * (candidate_value - best_value)
+        if difference:
             return difference < 0
     return (candidate[keys[2]], candidate[keys[3]]) < (best[keys[2]], best[keys[3]])
 
@@ -140,6 +175,35 @@ def evaluate_geometry_validation(
         **stats,
         "validation_silhouette": silhouette_sum / len(indices) if indices else float("nan"),
         "validation_iou": iou_sum / len(indices) if indices else float("nan"),
+    }
+
+
+@torch.no_grad()
+def evaluate_geometry_validity(
+    base_mesh: Meshes, offsets: torch.Tensor, cfg: Config,
+) -> dict[str, float]:
+    """Return reference-free mesh-health metrics for best-state selection.
+
+    The diagnostics inspect only the current reconstructed mesh. Neither the
+    initial sphere/CAD positions nor external evaluation data are inputs, so
+    this works for both CAD-prior and image-only topology while preserving the
+    evaluation isolation boundary.
+    """
+    report = inspect_mesh_validity(
+        _mesh_with_offsets(base_mesh, offsets),
+        max_edge_length_ratio=cfg.mesh_max_edge_length_ratio,
+        spike_ratio=cfg.mesh_spike_ratio,
+        min_component_faces=cfg.mesh_min_component_faces,
+    )
+    return {
+        "validity_is_valid": float(report.is_valid),
+        "validity_non_finite_vertex_count": float(report.non_finite_vertex_count),
+        "validity_degenerate_face_count": float(report.degenerate_face_count),
+        "validity_self_intersection_pair_count": float(report.self_intersection_pair_count),
+        "validity_spike_vertex_count": float(report.spike_vertex_count),
+        "validity_extreme_edge_count": float(report.extreme_edge_count),
+        "validity_disconnected_fragment_count": float(report.disconnected_fragment_count),
+        "validity_small_component_count": float(report.small_component_count),
     }
 
 
@@ -238,6 +302,14 @@ def train_geometry(
     output_dir: Path,
     mesh_stats: dict | None = None,
 ) -> ReconstructionResult:
+    """Refine a mesh against image observations.
+
+    ``cad_prior`` retains the legacy local-CAD deformation objective.  In
+    ``image_only`` mode ``base_mesh`` is the generated coarse visual-hull mesh:
+    its arbitrary topology is fixed during this differentiable stage, but its
+    vertices are unconstrained by the initial sphere/CAD and by the CAD 3%
+    local-deformation limit.
+    """
     reconstruction_dir = output_dir / "reconstruction"
     checkpoint_dir = reconstruction_dir / "checkpoints"
     preview_dir = reconstruction_dir / "previews"
@@ -272,11 +344,12 @@ def train_geometry(
     print(f"  resolution: {dataset.canvas_size}")
     print(f"  faces per pixel: {cfg.silhouette_faces_per_pixel}")
 
-    # The reference already includes frozen global alignment. No camera or
-    # alignment parameters belong to this optimizer.
+    image_only = cfg.reconstruction_mode == "image_only"
+    # Cameras/alignment are frozen before either refinement mode.  CAD mode
+    # uses the aligned CAD reference; image-only mode uses only coarse geometry.
     base_mesh = base_mesh.detach()
     camera_model.freeze()
-    local_basis = _local_offset_basis(base_mesh.verts_padded())
+    local_basis = None if image_only else _local_offset_basis(base_mesh.verts_padded())
     offsets = torch.zeros_like(base_mesh.verts_padded(), device=device, requires_grad=True)
     optimizer = torch.optim.Adam([offsets], lr=cfg.opt_lr_verts)
     losses_path = reconstruction_dir / "losses.csv"
@@ -290,8 +363,9 @@ def train_geometry(
     vertices = base_mesh.verts_packed()
     object_size = float(torch.linalg.vector_norm(vertices.max(0).values - vertices.min(0).values).cpu())
     max_local_displacement = cfg.max_local_deformation_ratio * object_size
-    with torch.no_grad():
-        offsets.copy_(_bounded_local_offsets(offsets, local_basis, max_local_displacement))
+    if not image_only:
+        with torch.no_grad():
+            offsets.copy_(_bounded_local_offsets(offsets, local_basis, max_local_displacement))
     representative = set(dataset.representative_indices())
     usage_counts = [0] * len(dataset)
     timing = {"render": [], "regularization": [], "backward": []}
@@ -304,7 +378,12 @@ def train_geometry(
         )]
         for index in selected:
             usage_counts[index] += 1
-        epoch_values: dict[str, list[float]] = {key: [] for key in ("total", "silhouette", "rgb", "normal", "anchor", "local_smoothness", "iou")}
+        epoch_values: dict[str, list[float]] = {
+            key: [] for key in (
+                "total", "silhouette", "rgb", "normal", "anchor", "local_smoothness",
+                "smoothness", "edge", "coarse_anchor", "iou",
+            )
+        }
         batches = _batch_indices(selected, cfg.geometry_view_batch_size)
         step_bar = tqdm(batches, desc=f"geometry epoch {epoch}/{cfg.num_epochs}", leave=False)
         for step, batch in enumerate(step_bar, start=1):
@@ -312,7 +391,10 @@ def train_geometry(
             target_rgb = torch.stack([sample.image for sample in samples]).to(device)
             target_alpha = torch.stack([sample.alpha for sample in samples]).to(device)
             cameras = camera_model.cameras(batch)
-            mesh = _mesh_with_offsets(base_mesh, _bounded_local_offsets(offsets, local_basis, max_local_displacement))
+            effective_offsets = offsets if image_only else _bounded_local_offsets(
+                offsets, local_basis, max_local_displacement,
+            )
+            mesh = _mesh_with_offsets(base_mesh, effective_offsets)
 
             render_started = time.perf_counter()
             rendered_alpha = renderer.render_mask(mesh, cameras)
@@ -326,15 +408,28 @@ def train_geometry(
             rgb = masked_rgb_loss(rendered_rgb, target_rgb, target_alpha) if rendered_rgb is not None else torch.zeros_like(silhouette)
 
             regularization_started = time.perf_counter()
-            regs = regularization_losses(mesh, base_mesh)
+            if image_only:
+                regs = image_only_regularization_losses(mesh, base_mesh)
+                # No reference_anchor_loss against a CAD/sphere and no CAD
+                # local-deformation restriction are present in this branch.
+                total = (
+                    cfg.loss_silhouette_weight * silhouette
+                    + cfg.loss_rgb_weight * rgb
+                    + cfg.loss_normal_weight * regs["normal"]
+                    + cfg.loss_laplacian_weight * regs["smoothness"]
+                    + cfg.loss_edge_weight * regs["edge"]
+                    + cfg.image_only_coarse_anchor_weight * regs["coarse_anchor"]
+                )
+            else:
+                regs = regularization_losses(mesh, base_mesh)
+                total = (
+                    cfg.loss_silhouette_weight * silhouette
+                    + cfg.loss_rgb_weight * rgb
+                    + cfg.loss_normal_weight * regs["normal"]
+                    + cfg.loss_anchor_weight * regs["anchor"]
+                    + cfg.loss_local_smoothness_weight * regs["local_smoothness"]
+                )
             timing["regularization"].append(time.perf_counter() - regularization_started)
-            total = (
-                cfg.loss_silhouette_weight * silhouette
-                + cfg.loss_rgb_weight * rgb
-                + cfg.loss_normal_weight * regs["normal"]
-                + cfg.loss_anchor_weight * regs["anchor"]
-                + cfg.loss_local_smoothness_weight * regs["local_smoothness"]
-            )
             if not torch.isfinite(total):
                 raise ReconstructionGateError("GATE 5 — OPTIMIZATION HEALTH FAILED: loss is NaN/Inf.")
             optimizer.zero_grad(set_to_none=True)
@@ -343,14 +438,19 @@ def train_geometry(
             if offsets.grad is None or not torch.isfinite(offsets.grad).all():
                 raise ReconstructionGateError("GATE 5 — OPTIMIZATION HEALTH FAILED: vertex gradient is NaN/Inf.")
             optimizer.step()
-            with torch.no_grad():
-                offsets.copy_(_bounded_local_offsets(offsets, local_basis, max_local_displacement))
+            if not image_only:
+                with torch.no_grad():
+                    offsets.copy_(_bounded_local_offsets(offsets, local_basis, max_local_displacement))
             timing["backward"].append(time.perf_counter() - backward_started)
 
             values = {
                 "total": total, "silhouette": silhouette, "rgb": rgb,
                 "normal": regs["normal"],
-                "anchor": regs["anchor"], "local_smoothness": regs["local_smoothness"],
+                "anchor": regs.get("anchor", torch.zeros_like(silhouette)),
+                "local_smoothness": regs.get("local_smoothness", torch.zeros_like(silhouette)),
+                "smoothness": regs.get("smoothness", torch.zeros_like(silhouette)),
+                "edge": regs.get("edge", torch.zeros_like(silhouette)),
+                "coarse_anchor": regs.get("coarse_anchor", torch.zeros_like(silhouette)),
                 "iou": soft_iou_per_image(rendered_alpha.detach(), target_alpha).mean(),
             }
             for key, value in values.items():
@@ -361,7 +461,8 @@ def train_geometry(
             base_mesh, offsets, dataset, camera_model, renderer, validation_indices,
             cfg.geometry_view_batch_size, device, object_size,
         )
-        if stats["max_vertex_displacement_ratio"] > cfg.max_vertex_displacement_ratio:
+        validity = evaluate_geometry_validity(base_mesh, offsets, cfg)
+        if not image_only and stats["max_vertex_displacement_ratio"] > cfg.max_vertex_displacement_ratio:
             offsets.data.copy_(previous_valid_offsets)
             save_checkpoint(checkpoint_dir / "last_valid_checkpoint.pt", offsets, epoch - 1, {"gate": "deformation_safety"})
             raise ReconstructionGateError(
@@ -369,17 +470,25 @@ def train_geometry(
                 f"max displacement ratio {stats['max_vertex_displacement_ratio']:.4f} exceeds {cfg.max_vertex_displacement_ratio:.4f}."
             )
         previous_valid_offsets = offsets.detach().clone()
-        row = {"epoch": epoch, **{key: sum(values) / max(len(values), 1) for key, values in epoch_values.items()}, **stats}
+        row = {
+            "epoch": epoch,
+            **{key: sum(values) / max(len(values), 1) for key, values in epoch_values.items()},
+            **stats,
+            **validity,
+        }
         # Training metrics average optimization batches before their updates;
         # validation and displacement describe the state after the epoch.
         # Keep the original names for existing CSV consumers.
         row.update(training_objective=row["total"], training_silhouette=row["silhouette"],
                    training_iou=row["iou"])
-        constraints_satisfied = (
-            all(math.isfinite(value) for key, value in stats.items() if not key.startswith("validation_"))
-            and stats["max_vertex_displacement_ratio"] <= min(
-                cfg.max_local_deformation_ratio, cfg.max_vertex_displacement_ratio)
+        constraints_satisfied = all(
+            math.isfinite(value) for key, value in stats.items() if not key.startswith("validation_")
         )
+        if not image_only:
+            constraints_satisfied = constraints_satisfied and (
+                stats["max_vertex_displacement_ratio"] <= min(
+                    cfg.max_local_deformation_ratio, cfg.max_vertex_displacement_ratio)
+            )
         is_best = is_better_geometry_state(row, best_metrics, constraints_satisfied=constraints_satisfied)
         if is_best:
             best_metrics = row.copy()

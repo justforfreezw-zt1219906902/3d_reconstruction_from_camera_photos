@@ -109,6 +109,7 @@ class OpenScanCameraModel(torch.nn.Module):
         self.max_phi_delta_deg = max_phi_delta_deg
         self.raw_theta_delta = torch.nn.Parameter(torch.zeros(len(theta_deg), device=device), requires_grad=pose_refine)
         self.raw_phi_delta = torch.nn.Parameter(torch.zeros(len(phi_deg), device=device), requires_grad=pose_refine)
+        self.calibration_frozen = False
 
     @property
     def distance(self) -> torch.Tensor:
@@ -209,6 +210,7 @@ class OpenScanCameraModel(torch.nn.Module):
     def freeze(self) -> None:
         for parameter in self.parameters():
             parameter.requires_grad_(False)
+        self.calibration_frozen = True
 
     def global_parameters(self) -> list[torch.nn.Parameter]:
         return [self.raw_distance, self.raw_fov, self.raw_x_offset, self.raw_y_offset]

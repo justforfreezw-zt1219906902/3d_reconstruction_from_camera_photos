@@ -41,6 +41,37 @@ def save_stage_preview(
     sheet.save(path)
 
 
+@torch.no_grad()
+def save_mesh_stage_previews(
+    mesh,
+    dataset,
+    camera_model,
+    renderer,
+    indices: list[int],
+    output_dir: Path,
+    stage: str,
+) -> list[Path]:
+    """Render representative views for one named reconstruction stage.
+
+    This is deliberately diagnostic-only: it does not create gradients or
+    change the mesh/camera state.  Keeping stage names in the filenames makes
+    sphere, image-derived coarse, and selected-final previews directly
+    comparable in an artifact directory.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = mesh.verts_packed().device
+    paths: list[Path] = []
+    for index in sorted(set(indices)):
+        sample = dataset[index]
+        rendered_alpha = renderer.render_mask(mesh, camera_model.cameras([index]))
+        path = output_dir / f"{stage}_{index:04d}.png"
+        save_stage_preview(
+            sample.image[None].to(device), sample.alpha[None].to(device), rendered_alpha, path,
+        )
+        paths.append(path)
+    return paths
+
+
 def append_csv(path: Path, row: dict[str, float | int | str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()

@@ -76,6 +76,73 @@ def local_deformation_smoothness_loss(
     return differences.square().sum(dim=-1).mean()
 
 
+def coarse_edge_regularization_loss(
+    mesh: Meshes, coarse_mesh: Meshes,
+) -> torch.Tensor:
+    """Keep image-only edges near their image-derived coarse lengths.
+
+    This is an edge *regularity* term, not PyTorch3D's default edge loss: the
+    latter drives every edge towards zero length.  Here each edge is compared
+    with the corresponding edge in ``coarse_mesh`` and normalized by the
+    coarse mesh bounding-box diagonal.  Thus arbitrary marching-cubes
+    topology is supported, while a uniformly scaled object is not silently
+    rewarded with collapse.  ``coarse_mesh`` is detached and must have the
+    same generated topology as the current mesh.
+    """
+    if len(mesh) != len(coarse_mesh) or len(mesh) == 0:
+        raise ValueError("Current and coarse mesh batches must match and be nonempty")
+    values = []
+    for current, coarse in zip(mesh, coarse_mesh):
+        if not torch.equal(current.faces_packed(), coarse.faces_packed()):
+            raise ValueError("Current and coarse meshes must share topology")
+        edges = coarse.edges_packed()
+        if not len(edges):
+            values.append(current.verts_packed().sum() * 0.0)
+            continue
+        current_lengths = torch.linalg.vector_norm(
+            current.verts_packed()[edges[:, 0]] - current.verts_packed()[edges[:, 1]], dim=-1,
+        )
+        coarse_vertices = coarse.verts_packed().detach()
+        coarse_lengths = torch.linalg.vector_norm(
+            coarse_vertices[edges[:, 0]] - coarse_vertices[edges[:, 1]], dim=-1,
+        )
+        values.append(((current_lengths - coarse_lengths) / _reference_scale(coarse_vertices)).square().mean())
+    return torch.stack(values).mean()
+
+
+def image_only_regularization_losses(mesh: Meshes, coarse_mesh: Meshes) -> dict[str, torch.Tensor]:
+    """Regularizers for refinement of an image-derived coarse mesh.
+
+    ``normal`` penalizes inconsistent orientation across adjacent faces.
+    ``smoothness`` penalizes abrupt changes in the coarse-to-current vertex
+    displacement field across coarse-mesh edges, suppressing isolated spikes
+    without requiring the initial CAD/sphere.  ``edge`` preserves local edge
+    scale relative to the coarse reconstruction and prevents edge collapse.
+    ``coarse_anchor`` is an optional, explicitly coarse-mesh-only proximity
+    term; callers control it with ``IMAGE_ONLY_COARSE_ANCHOR_WEIGHT`` and its
+    default weight is zero.
+    """
+    if len(mesh) != len(coarse_mesh) or len(mesh) == 0:
+        raise ValueError("Current and coarse mesh batches must match and be nonempty")
+    normal = mesh_normal_consistency(mesh)
+    smoothness, anchors = [], []
+    for current, coarse in zip(mesh, coarse_mesh):
+        if not torch.equal(current.faces_packed(), coarse.faces_packed()):
+            raise ValueError("Current and coarse meshes must share topology")
+        current_vertices = current.verts_packed()
+        coarse_vertices = coarse.verts_packed().detach()
+        smoothness.append(local_deformation_smoothness_loss(
+            current_vertices - coarse_vertices, coarse.edges_packed(), coarse_vertices,
+        ))
+        anchors.append(reference_anchor_loss(current_vertices, coarse_vertices))
+    return {
+        "normal": normal,
+        "smoothness": torch.stack(smoothness).mean(),
+        "edge": coarse_edge_regularization_loss(mesh, coarse_mesh),
+        "coarse_anchor": torch.stack(anchors).mean(),
+    }
+
+
 def regularization_losses(
     mesh: Meshes, reference_mesh: Meshes | None = None,
 ) -> dict[str, torch.Tensor]:
